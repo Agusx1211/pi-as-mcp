@@ -13,7 +13,7 @@ ToolMode = Literal["none", "read-only", "write", "full"]
 
 DEFAULT_PI_BIN = "pi"
 DEFAULT_PI_AGENT_DIR = "~/.pi/agent"
-DEFAULT_TURN_TIMEOUT_SECONDS = 300
+DEFAULT_TURN_TIMEOUT_SECONDS = 600
 DEFAULT_MODEL_VALIDATION_TIMEOUT_SECONDS = 15
 
 TOOL_PROFILES: dict[str, list[str]] = {

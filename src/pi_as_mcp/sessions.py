@@ -44,7 +44,7 @@ CONCURRENCY_COUNTED_STATUSES = {"starting", "running"}
 # Turns are bounded by inactivity, not wall-clock: a turn that keeps streaming
 # tokens, calling tools, or returning results stays alive indefinitely; only a
 # running turn that produces nothing for this long is treated as stalled.
-DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 300
+DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 600
 # Separate, short bound for the prompt-accept handshake (Pi acks immediately).
 PROMPT_ACK_TIMEOUT_SECONDS = 30
 # How long a worker may sit idle (turn finished, awaiting a possible follow-up)

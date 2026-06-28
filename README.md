@@ -114,7 +114,7 @@ Tool modes:
 | `full` | `read,grep,find,ls,edit,write,bash` |
 
 A running turn is bounded by inactivity, not wall-clock. A turn that produces
-no activity for 300 seconds is aborted as stalled (`status: timeout`).
+no activity for 600 seconds is aborted as stalled (`status: timeout`).
 
 ### `agent_reply`
 
