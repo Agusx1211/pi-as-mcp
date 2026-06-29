@@ -270,6 +270,10 @@ class PiAgentTui(App[None]):
         self.status_frame = 0
         self._tree_structure_signature: tuple[tuple[str, tuple[str, ...]], ...] | None = None
         self._last_log_signature: str | None = None
+        # (agent_id, status) of the agent the current self.detail describes. Lets a
+        # poll skip the expensive debug inspect when the selected agent is idle and
+        # unchanged, instead of re-pulling its whole transcript every second.
+        self._detail_key: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("Pi Agents", id="title")
@@ -285,8 +289,11 @@ class PiAgentTui(App[None]):
         tree.auto_expand = False
         tree.show_horizontal_scrollbar = False
         tree.focus()
+        # First paint is synchronous (one blocking poll at startup), then every
+        # recurring poll runs in a worker thread via schedule_refresh so daemon
+        # I/O never blocks the event loop (input, scrolling, the status spinner).
         self.refresh_data()
-        self.set_interval(1.0, self.refresh_data)
+        self.set_interval(1.0, self.schedule_refresh)
         self.set_interval(0.18, self.animate_status)
 
     @property
@@ -336,18 +343,89 @@ class PiAgentTui(App[None]):
             elif node.children:
                 self.agent_tree.select_node(node.children[0])
 
+    def schedule_refresh(self) -> None:
+        """Timer entry point: run one poll in a worker thread.
+
+        All daemon I/O (the tui_summary round-trip plus the optional debug
+        inspect) happens off the event loop, so a slow or timed-out poll can no
+        longer freeze input, scrolling, or the status animation. `exclusive`
+        means a poll that overruns the 1s interval is superseded rather than
+        piling up behind the previous one.
+        """
+        self.run_worker(
+            self._refresh_worker,
+            name="refresh",
+            group="refresh",
+            exclusive=True,
+            thread=True,
+        )
+
+    def _refresh_worker(self) -> None:
+        snapshot = self._fetch_snapshot()
+        # Hop back to the event loop to mutate widgets/state safely.
+        self.call_from_thread(self._apply_snapshot, snapshot)
+
     def refresh_data(self) -> None:
+        """Synchronous poll (fetch + apply). Used for the first paint, the manual
+        `r` refresh, and tests; the recurring timer uses schedule_refresh."""
+        self._apply_snapshot(self._fetch_snapshot())
+
+    def _fetch_snapshot(self) -> dict[str, Any]:
+        """Blocking fetch with no widget/state mutation — safe in a worker thread.
+
+        Returns everything _apply_snapshot needs. The selected agent's full debug
+        transcript is only re-fetched when it is live (starting/running), when the
+        selection changed, or when its status changed; an idle, unchanged agent
+        reuses the last detail instead of re-pulling its whole transcript.
+        """
         try:
             data = self.client.request("tui_summary", request_timeout_seconds=4)
-            agents = data.get("agents")
-            self.agents = agents if isinstance(agents, list) else []
-            stats = data.get("stats")
-            self.stats_summary = stats if isinstance(stats, dict) else {}
+        except (DaemonClientError, OSError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+        agents = data.get("agents")
+        agents = agents if isinstance(agents, list) else []
+        stats = data.get("stats")
+        stats = stats if isinstance(stats, dict) else {}
+
+        ids = [str(agent.get("agent_id") or "") for agent in agents]
+        if self.selected_agent_id in ids:
+            selected: str | None = self.selected_agent_id
+        else:
+            selected = ids[0] if ids else None
+
+        detail = None
+        detail_key: tuple[str, str] | None = None
+        if selected:
+            summary = next((a for a in agents if str(a.get("agent_id") or "") == selected), None)
+            status = str(summary.get("status") or "").lower() if isinstance(summary, dict) else ""
+            detail_key = (selected, status)
+            live = status in {"starting", "running"}
+            changed = selected != self.selected_agent_id
+            stale = not isinstance(self.detail, dict) or self.detail.get("agent_id") != selected
+            if live or changed or stale or detail_key != self._detail_key:
+                detail = self._inspect(selected)
+            else:
+                detail = self.detail
+        return {
+            "ok": True,
+            "agents": agents,
+            "stats": stats,
+            "selected": selected,
+            "detail": detail,
+            "detail_key": detail_key,
+        }
+
+    def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if snapshot.get("ok"):
+            self.agents = snapshot["agents"]
+            self.stats_summary = snapshot["stats"]
             self.error = None
             self.refresh_failed = False
-            self.reconcile_selection()
-            self.load_detail()
-        except (DaemonClientError, OSError, json.JSONDecodeError) as exc:
+            self.selected_agent_id = snapshot["selected"]
+            self.detail = snapshot["detail"]
+            self._detail_key = snapshot["detail_key"]
+        else:
             # A single slow or timed-out poll must not blank the whole dashboard
             # and then repaint it a second later (the "things keep disappearing"
             # flicker). Keep the last-known agents and selection, and only fall
@@ -355,10 +433,11 @@ class PiAgentTui(App[None]):
             if self.agents:
                 self.refresh_failed = True
             else:
-                self.error = str(exc)
+                self.error = snapshot.get("error")
                 self.stats_summary = {}
                 self.detail = None
                 self.selected_agent_id = None
+                self._detail_key = None
         self.render_all()
 
     def reconcile_selection(self) -> None:
@@ -374,12 +453,18 @@ class PiAgentTui(App[None]):
     def load_detail(self) -> None:
         if not self.selected_agent_id:
             self.detail = None
+            self._detail_key = None
             return
+        self.detail = self._inspect(self.selected_agent_id)
+        status = str(self.detail.get("status") or "").lower() if isinstance(self.detail, dict) else ""
+        self._detail_key = (self.selected_agent_id, status)
+
+    def _inspect(self, agent_id: str) -> dict[str, Any]:
         try:
-            self.detail = self.client.request(
+            return self.client.request(
                 "inspect",
                 request_timeout_seconds=4,
-                agent_id=self.selected_agent_id,
+                agent_id=agent_id,
                 include_events=True,
                 verbosity="debug",
                 # The dashboard is a passive viewer; polling inspect must not mark
@@ -387,7 +472,7 @@ class PiAgentTui(App[None]):
                 observe=False,
             )
         except (DaemonClientError, OSError, json.JSONDecodeError) as exc:
-            self.detail = {"agent_id": self.selected_agent_id, "error": str(exc)}
+            return {"agent_id": agent_id, "error": str(exc)}
 
     def render_all(self) -> None:
         # "live" is what the tree can actually show (daemon-owned sessions right
@@ -557,16 +642,31 @@ class PiAgentTui(App[None]):
         return table
 
     def log_signature(self) -> str:
-        payload = {
-            "agent_id": self.selected_agent_id,
-            "error": self.error,
-            "detail_error": self.detail.get("error") if isinstance(self.detail, dict) else None,
-            "prompts": self.detail.get("prompts") if isinstance(self.detail, dict) else None,
-            "transcript": self.detail.get("transcript") if isinstance(self.detail, dict) else None,
-            "final_text": self.detail.get("final_text") if isinstance(self.detail, dict) else None,
-            "stats": self.detail.get("stats") if isinstance(self.detail, dict) else None,
-        }
-        return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        # Cheap O(1) fingerprint instead of serializing the whole transcript every
+        # tick. Streaming only ever grows the transcript (new item) or extends the
+        # last item's text in place, so item-count + last-item length captures live
+        # updates; the rest catches structural changes.
+        detail = self.detail if isinstance(self.detail, dict) else {}
+        transcript = detail.get("transcript")
+        transcript = transcript if isinstance(transcript, list) else []
+        last = transcript[-1] if transcript and isinstance(transcript[-1], dict) else {}
+        prompts = detail.get("prompts")
+        prompts = prompts if isinstance(prompts, list) else []
+        stats = detail.get("stats") if isinstance(detail.get("stats"), dict) else {}
+        parts = (
+            self.selected_agent_id or "",
+            str(self.error or ""),
+            str(detail.get("error") or ""),
+            str(detail.get("status") or ""),
+            str(detail.get("turn_count") or ""),
+            str(len(prompts)),
+            str(len(transcript)),
+            str(last.get("kind") or ""),
+            str(len(str(last.get("text") or last.get("result_preview") or ""))),
+            str(len(str(detail.get("final_text") or ""))),
+            str(stats.get("latest_score") or ""),
+        )
+        return "\x1f".join(parts)
 
     def render_log_if_changed(self, *, force: bool = False) -> None:
         signature = self.log_signature()
