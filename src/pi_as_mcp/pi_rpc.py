@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -15,6 +17,11 @@ DEFAULT_PI_BIN = "pi"
 DEFAULT_PI_AGENT_DIR = "~/.pi/agent"
 DEFAULT_TURN_TIMEOUT_SECONDS = 600
 DEFAULT_MODEL_VALIDATION_TIMEOUT_SECONDS = 15
+# How long a successful model validation stays cached before we re-spawn
+# `pi --list-models`. Spawning pi costs ~0.75s of node startup, and it sits on
+# the critical path of every delegate, so we avoid re-validating an unchanged
+# (provider, model) pair on each call.
+MODEL_VALIDATION_CACHE_TTL_SECONDS = 300
 
 TOOL_PROFILES: dict[str, list[str]] = {
     "none": [],
@@ -101,10 +108,38 @@ def pi_agent_dir() -> Path:
     return Path(env_default("PI_CODING_AGENT_DIR", DEFAULT_PI_AGENT_DIR)).expanduser()
 
 
+# Cache parsed settings.json keyed by (path, st_mtime_ns, st_size). load_pi_settings
+# is called several times per delegate (resolve_model, configured_model_specs,
+# configured_model_aliases, pi_configured_provider); re-parsing each time wastes a
+# disk read + JSON parse on the critical path. A missing file is cached with a
+# `None` stat key so we still cheaply re-check existence via os.stat each call.
+_PI_SETTINGS_LOCK = threading.Lock()
+_PI_SETTINGS_CACHE: dict[str, tuple[tuple[int, int] | None, dict[str, Any]]] = {}
+
+
+def _stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
 def load_pi_settings() -> dict[str, Any]:
     settings_path = pi_agent_dir() / "settings.json"
-    if not settings_path.exists():
-        return {}
+    cache_key = str(settings_path)
+    stat_key = _stat_key(settings_path)
+
+    with _PI_SETTINGS_LOCK:
+        cached = _PI_SETTINGS_CACHE.get(cache_key)
+        if cached is not None and cached[0] == stat_key:
+            return cached[1]
+
+    if stat_key is None:
+        result: dict[str, Any] = {}
+        with _PI_SETTINGS_LOCK:
+            _PI_SETTINGS_CACHE[cache_key] = (None, result)
+        return result
 
     try:
         parsed = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -113,6 +148,9 @@ def load_pi_settings() -> dict[str, Any]:
 
     if not isinstance(parsed, dict):
         raise PiRpcError(f"Pi settings file must contain a JSON object: {settings_path}")
+
+    with _PI_SETTINGS_LOCK:
+        _PI_SETTINGS_CACHE[cache_key] = (stat_key, parsed)
     return parsed
 
 
@@ -362,6 +400,11 @@ def model_context_tokens(output: str, provider: str, model: str) -> int | None:
 class PiRpcRunner:
     def __init__(self, pi_bin: str | None = None) -> None:
         self.pi_bin = pi_bin or env_default("PI_AS_MCP_PI_BIN", DEFAULT_PI_BIN)
+        # Cache of successful model validations keyed by (provider, model). Each
+        # entry stores (context_tokens, monotonic_expiry). Only successful
+        # validations are cached so transient failures can be retried.
+        self._validate_cache: dict[tuple[str, str], tuple[int | None, float]] = {}
+        self._validate_cache_lock = threading.Lock()
 
     def health(
         self,
@@ -405,6 +448,13 @@ class PiRpcRunner:
         return rows
 
     def validate_model(self, provider: str, model: str, *, timeout_seconds: int = 15) -> int | None:
+        cache_key = (provider, model)
+        now = time.monotonic()
+        with self._validate_cache_lock:
+            cached = self._validate_cache.get(cache_key)
+            if cached is not None and cached[1] > now:
+                return cached[0]
+
         listing = self.list_models(model, timeout_seconds=timeout_seconds)
         if listing.returncode != 0:
             raise PiRpcError(
@@ -416,7 +466,13 @@ class PiRpcRunner:
                 "Configured Pi model was not found exactly in `pi --list-models` output: "
                 f"provider={provider!r} model={model!r}."
             )
-        return model_context_tokens(listing.stdout, provider, model)
+        context_tokens = model_context_tokens(listing.stdout, provider, model)
+        with self._validate_cache_lock:
+            self._validate_cache[cache_key] = (
+                context_tokens,
+                time.monotonic() + MODEL_VALIDATION_CACHE_TTL_SECONDS,
+            )
+        return context_tokens
 
     def list_models(self, search: str, *, timeout_seconds: int = 15) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()

@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -115,6 +116,123 @@ while True:
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def write_slow_fake_pi(tmp_path: Path, *, delay: float) -> Path:
+    """A worker whose model-validation spawn (`--list-models`) is slow, so the
+    expensive part of a start is observable from another thread."""
+    path = tmp_path / f"fake-pi-slow-{delay}"
+    path.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+import time
+
+if "--list-models" in sys.argv:
+    time.sleep({delay})
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+line = sys.stdin.readline()
+request = json.loads(line)
+print(json.dumps({{"id": request["id"], "type": "response", "command": "prompt", "success": True}}), flush=True)
+print(json.dumps({{"type": "agent_start"}}), flush=True)
+while True:
+    time.sleep(1)
+""",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def test_daemon_start_does_not_hold_lock_during_spawn(tmp_path: Path) -> None:
+    fake_pi = write_slow_fake_pi(tmp_path, delay=1.5)
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="slow-spawn-scope", owner_pid=None, label="slow")
+    try:
+        state.manager_for(identity)._runner.pi_bin = str(fake_pi)
+
+        result: dict[str, object] = {}
+
+        def run() -> None:
+            result["snapshot"] = state.start(
+                identity,
+                prompt="spawn slowly",
+                cwd=str(tmp_path),
+                model="local/example-model",
+                provider=None,
+                tool_mode="none",
+                include_events=False,
+            )
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            # Let the start enter the slow worker spawn (it briefly took the lock
+            # to reserve a slot, then released it before spawning).
+            time.sleep(0.3)
+            # If the lock were held across the whole spawn this would block until
+            # the ~1.5s spawn finished; we require it free almost immediately.
+            acquired = state._lock.acquire(timeout=0.5)
+            assert acquired, "daemon lock was held across the agent spawn"
+            state._lock.release()
+        finally:
+            worker.join(timeout=10)
+
+        assert isinstance(result.get("snapshot"), dict)
+        assert result["snapshot"]["agent_id"]
+    finally:
+        state.close()
+
+
+def test_daemon_concurrent_starts_respect_limit(tmp_path: Path, monkeypatch) -> None:
+    fake_pi = write_slow_fake_pi(tmp_path, delay=0.7)
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(write_config(tmp_path, {"local/example-model": 1})))
+    state = DaemonState()
+    first_identity = ParentIdentity(scope_id="conc-first", owner_pid=None, label="first")
+    second_identity = ParentIdentity(scope_id="conc-second", owner_pid=None, label="second")
+    try:
+        state.manager_for(first_identity)._runner.pi_bin = str(fake_pi)
+        state.manager_for(second_identity)._runner.pi_bin = str(fake_pi)
+
+        results: dict[str, tuple[str, object]] = {}
+        barrier = threading.Barrier(2)
+
+        def run(key: str, identity: ParentIdentity) -> None:
+            barrier.wait()
+            try:
+                snapshot = state.start(
+                    identity,
+                    prompt=key,
+                    cwd=str(tmp_path),
+                    model="local/example-model",
+                    provider=None,
+                    tool_mode="none",
+                    include_events=False,
+                )
+                results[key] = ("ok", snapshot)
+            except PiRpcError as exc:
+                results[key] = ("err", str(exc))
+
+        threads = [
+            threading.Thread(target=run, args=("first", first_identity)),
+            threading.Thread(target=run, args=("second", second_identity)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        # The reservation (held only under the lock) keeps the limit honest even
+        # while the winner is still spawning: exactly one start wins, one is rejected.
+        kinds = sorted(value[0] for value in results.values())
+        assert kinds == ["err", "ok"], results
+        rejection = next(value[1] for value in results.values() if value[0] == "err")
+        assert "concurrency limit reached" in str(rejection)
+    finally:
+        state.close()
 
 
 def test_daemon_unsafe_read_only_config_upgrades_read_only_requests(tmp_path: Path, monkeypatch) -> None:

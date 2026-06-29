@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,10 +80,37 @@ def config_path() -> Path:
     return Path.home() / DEFAULT_CONFIG_PATH
 
 
+# Cache parsed config keyed by (path, st_mtime_ns, st_size). load_config is hit on
+# the daemon hot path (manager_for, start, score_hint, ...); re-reading + re-parsing
+# config.json each call is wasted work. A missing file is cached with a `None` stat
+# key so we still cheaply re-check existence via os.stat each call.
+_CONFIG_LOCK = threading.Lock()
+_CONFIG_CACHE: dict[str, tuple[tuple[int, int] | None, AppConfig]] = {}
+
+
+def _stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
 def load_config() -> AppConfig:
     path = config_path()
-    if not path.exists():
-        return AppConfig(agents=AgentsConfig(model_concurrency_limits={}), path=None)
+    cache_key = str(path)
+    stat_key = _stat_key(path)
+
+    with _CONFIG_LOCK:
+        cached = _CONFIG_CACHE.get(cache_key)
+        if cached is not None and cached[0] == stat_key:
+            return cached[1]
+
+    if stat_key is None:
+        result = AppConfig(agents=AgentsConfig(model_concurrency_limits={}), path=None)
+        with _CONFIG_LOCK:
+            _CONFIG_CACHE[cache_key] = (None, result)
+        return result
 
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -92,7 +120,10 @@ def load_config() -> AppConfig:
     if not isinstance(payload, dict):
         raise PiRpcError(f"pi-as-mcp config must contain a JSON object: {path}")
 
-    return AppConfig(agents=parse_agents_config(payload.get("agents"), path=path), path=path)
+    result = AppConfig(agents=parse_agents_config(payload.get("agents"), path=path), path=path)
+    with _CONFIG_LOCK:
+        _CONFIG_CACHE[cache_key] = (stat_key, result)
+    return result
 
 
 def parse_agents_config(value: Any, *, path: Path) -> AgentsConfig:

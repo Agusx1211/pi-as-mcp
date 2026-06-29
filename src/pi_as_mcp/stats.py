@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -36,6 +37,50 @@ class StatsStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or stats_dir()
         self._lock = threading.RLock()
+        # Authoritative in-memory aggregates. The daemon is the sole writer of
+        # agent-events.jsonl (via _append_jsonl), so we can maintain these
+        # incrementally and serve hot-path reads (stats_for_agents / summary)
+        # from memory instead of re-parsing the whole (multi-MB, never-rotated)
+        # log on every call. We seed once from disk on init so a restarted
+        # daemon reconstructs the same state.
+        self._agents: dict[str, dict[str, Any]] = {}
+        self._observed_count = 0
+        self._score_count = 0
+        self._score_total = 0
+        self._seed_from_disk()
+
+    def _seed_from_disk(self) -> None:
+        with self._lock:
+            for event in self._read_jsonl(self.agent_events_path):
+                self._ingest_event(event)
+
+    def _ingest_event(self, event: dict[str, Any]) -> None:
+        """Fold one agent-events record into the in-memory aggregates.
+
+        Mirrors the per-agent row construction of ``stats_for_agents`` and the
+        counter logic of ``summary`` so the in-memory state stays byte-for-byte
+        equivalent to a full file re-parse. Must be called under ``self._lock``.
+        """
+        agent_id = str(event.get("agent_id") or "")
+        if not agent_id:
+            return
+        # Copy so the in-memory row never aliases nested objects (prompts,
+        # usage, event_counts, ...) held by the caller, matching the prior
+        # behaviour where every row was rebuilt from freshly parsed records.
+        event = copy.deepcopy(event)
+        row = self._agents.get(agent_id)
+        if row is None:
+            row = empty_agent_stats(agent_id)
+            self._agents[agent_id] = row
+        before_observed = bool(row.get("observed_by_parent"))
+        apply_agent_event(row, event)
+        if not before_observed and row.get("observed_by_parent"):
+            self._observed_count += 1
+        if event.get("type") == "agent_score":
+            score = event.get("score")
+            if isinstance(score, int):
+                self._score_count += 1
+                self._score_total += score
 
     @property
     def agent_events_path(self) -> Path:
@@ -164,35 +209,19 @@ class StatsStore:
         if not wanted:
             return rows
 
-        for event in self._read_jsonl(self.agent_events_path):
-            agent_id = str(event.get("agent_id") or "")
-            if agent_id not in wanted:
-                continue
-            rows.setdefault(agent_id, empty_agent_stats(agent_id))
-            apply_agent_event(rows[agent_id], event)
+        with self._lock:
+            for agent_id in wanted:
+                row = self._agents.get(agent_id)
+                if row is not None:
+                    rows[agent_id] = copy.deepcopy(row)
         return rows
 
     def summary(self) -> dict[str, Any]:
-        agents: dict[str, dict[str, Any]] = {}
-        score_count = 0
-        score_total = 0
-        observed_count = 0
-        for event in self._read_jsonl(self.agent_events_path):
-            agent_id = str(event.get("agent_id") or "")
-            if not agent_id:
-                continue
-            agents.setdefault(agent_id, empty_agent_stats(agent_id))
-            before_observed = bool(agents[agent_id].get("observed_by_parent"))
-            apply_agent_event(agents[agent_id], event)
-            if not before_observed and agents[agent_id].get("observed_by_parent"):
-                observed_count += 1
-            if event.get("type") == "agent_score":
-                score = event.get("score")
-                if isinstance(score, int):
-                    score_count += 1
-                    score_total += score
-
-        total_agents = len(agents)
+        with self._lock:
+            total_agents = len(self._agents)
+            observed_count = self._observed_count
+            score_count = self._score_count
+            score_total = self._score_total
         return {
             "total_agents": total_agents,
             "observed_agents": observed_count,
@@ -214,6 +243,11 @@ class StatsStore:
                 path.chmod(0o600)
             except OSError:
                 pass
+            # Keep in-memory aggregates authoritative without re-reading the log.
+            # Only agent-events records feed the summary/per-agent stats; the
+            # separate scores.jsonl is a write-only audit trail.
+            if path == self.agent_events_path:
+                self._ingest_event(event)
 
     def _read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():

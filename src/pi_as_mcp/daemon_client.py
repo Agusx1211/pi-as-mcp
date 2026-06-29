@@ -21,7 +21,6 @@ class DaemonClient:
         self.parent_owner_pid = parent_owner_pid
 
     def request(self, command: str, *, request_timeout_seconds: int = 30, **params: Any) -> dict[str, Any]:
-        self.ensure_daemon()
         payload = {"command": command, **params}
         parent_hint = os.environ.get("PI_AGENT_PARENT_ID") or self.default_parent_hint
         if parent_hint:
@@ -29,6 +28,25 @@ class DaemonClient:
         if self.parent_owner_pid is not None:
             payload["parent_owner_pid"] = self.parent_owner_pid
 
+        # Happy path: try the real connection directly instead of probing with a
+        # throwaway socket first. Only spawn+wait for the daemon when the connect
+        # actually fails, then retry once.
+        try:
+            chunks = self._send(payload, request_timeout_seconds)
+        except OSError:
+            self.start_daemon()
+            chunks = self._send(payload, request_timeout_seconds)
+
+        if not chunks:
+            raise DaemonClientError("daemon returned no response")
+        response = json.loads(b"".join(chunks).decode("utf-8"))
+        if isinstance(response, dict) and response.get("error"):
+            raise DaemonClientError(str(response["error"]))
+        if not isinstance(response, dict):
+            raise DaemonClientError("daemon returned non-object response")
+        return response
+
+    def _send(self, payload: dict[str, Any], request_timeout_seconds: int) -> list[bytes]:
         path = socket_path()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(request_timeout_seconds)
@@ -40,19 +58,14 @@ class DaemonClient:
                 if not chunk:
                     break
                 chunks.append(chunk)
-
-        if not chunks:
-            raise DaemonClientError("daemon returned no response")
-        response = json.loads(b"".join(chunks).decode("utf-8"))
-        if isinstance(response, dict) and response.get("error"):
-            raise DaemonClientError(str(response["error"]))
-        if not isinstance(response, dict):
-            raise DaemonClientError("daemon returned non-object response")
-        return response
+        return chunks
 
     def ensure_daemon(self) -> None:
         if self._can_connect():
             return
+        self.start_daemon()
+
+    def start_daemon(self) -> None:
         log_file = log_path().open("ab")
         subprocess.Popen(
             [sys.executable, "-m", "pi_as_mcp.daemon"],

@@ -106,3 +106,82 @@ def test_stats_store_start_event_does_not_erase_completed_snapshot(tmp_path) -> 
     assert stats["turn_count"] == 1
     assert stats["final_text_preview"] == "done"
     assert stats["prompts"][0]["text"] == "work"
+
+
+def _populate(store: StatsStore) -> list[str]:
+    agent_ids = ["agent-1", "agent-2", "agent-3"]
+    for index, agent_id in enumerate(agent_ids, start=1):
+        snapshot = {
+            "agent_id": agent_id,
+            "status": "idle",
+            "created_at": 100.0 + index,
+            "cwd": f"/tmp/project-{index}",
+            "provider": "local",
+            "model": "example-model",
+            "tool_mode": "read-only",
+            "turn_count": index,
+            "tool_call_count": index,
+            "event_counts": {"agent_end": 1},
+            "usage": {"input_tokens": index, "output_tokens": index},
+            "final_text": f"done-{index}",
+            "prompts": [{"turn": 1, "behavior": "prompt", "text": f"task-{index}", "accepted": True}],
+        }
+        store.record_agent_snapshot(event_type="agent_started", snapshot=snapshot, requester={"display": f"r{index}"})
+        store.record_agent_snapshot(event_type="agent_updated", snapshot=snapshot, requester={"display": f"r{index}"})
+        store.record_observed(agent_id=agent_id, via="listen", snapshot=snapshot, requester={"display": f"r{index}"})
+        store.record_score(
+            agent_id=agent_id,
+            score=index + 4,
+            category="review",
+            comment=f"comment-{index}",
+            requester={"display": f"r{index}"},
+        )
+    return agent_ids
+
+
+def test_in_memory_aggregates_match_fresh_seed_load(tmp_path) -> None:
+    store = StatsStore(root=tmp_path)
+    agent_ids = _populate(store)
+
+    # A brand-new store seeds its in-memory state from the same on-disk log.
+    reloaded = StatsStore(root=tmp_path)
+
+    assert store.summary() == reloaded.summary()
+    assert store.stats_for_agents(agent_ids) == reloaded.stats_for_agents(agent_ids)
+    for agent_id in agent_ids:
+        assert store.agent_stats(agent_id) == reloaded.agent_stats(agent_id)
+
+
+def test_hot_path_reads_do_not_reparse_the_log(tmp_path, monkeypatch) -> None:
+    store = StatsStore(root=tmp_path)
+    agent_ids = _populate(store)
+
+    # After init + appends, no hot-path read should touch the file again.
+    def _boom(*args, **kwargs):
+        raise AssertionError("_read_jsonl must not be called on the hot path")
+
+    monkeypatch.setattr(store, "_read_jsonl", _boom)
+
+    summary = store.summary()
+    assert summary["total_agents"] == len(agent_ids)
+    assert summary["observed_agents"] == len(agent_ids)
+    assert summary["scores"] == len(agent_ids)
+    assert summary["average_score"] == 6.0
+
+    rows = store.stats_for_agents(agent_ids)
+    assert set(rows) == set(agent_ids)
+    assert store.agent_stats(agent_ids[0])["observed_by_parent"] is True
+
+
+def test_stats_for_agents_returns_isolated_copies(tmp_path) -> None:
+    store = StatsStore(root=tmp_path)
+    _populate(store)
+
+    rows = store.stats_for_agents(["agent-1"])
+    rows["agent-1"]["scores"].append({"score": 999})
+    rows["agent-1"]["status"] = "mutated"
+
+    # Mutating the returned copy must not corrupt the authoritative state.
+    fresh = store.stats_for_agents(["agent-1"])["agent-1"]
+    assert fresh["status"] == "idle"
+    assert len(fresh["scores"]) == 1

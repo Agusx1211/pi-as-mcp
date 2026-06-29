@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import pi_as_mcp.config as config_module
 from pi_as_mcp.config import load_config
 from pi_as_mcp.pi_rpc import PiRpcError
 
@@ -111,6 +112,46 @@ def test_session_persistence_settings_default_and_parse(tmp_path, monkeypatch: p
     agents = load_config().agents
     assert agents.persist_sessions is False
     assert agents.idle_eviction_seconds == 30
+
+
+def test_load_config_caches_until_file_changes(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"agents": {"enable_score": True}}), encoding="utf-8")
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+
+    parse_calls = 0
+    real_loads = config_module.json.loads
+
+    def counting_loads(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_loads(*args, **kwargs)
+
+    monkeypatch.setattr(config_module.json, "loads", counting_loads)
+
+    assert load_config().agents.enable_score is True
+    # Unchanged file: served from cache, no re-parse.
+    assert load_config().agents.enable_score is True
+    assert parse_calls == 1
+
+    # A real change on disk (different content + size) must be picked up.
+    config.write_text(
+        json.dumps({"agents": {"enable_score": False, "unsafe_read_only": True}}),
+        encoding="utf-8",
+    )
+    reloaded = load_config().agents
+    assert reloaded.enable_score is False
+    assert reloaded.unsafe_read_only is True
+    assert parse_calls == 2
+
+
+def test_load_config_caches_missing_then_created(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    assert load_config().path is None
+    # Creating the file afterwards is detected (cached miss is re-checked via stat).
+    config.write_text(json.dumps({"agents": {"enable_score": True}}), encoding="utf-8")
+    assert load_config().agents.enable_score is True
 
 
 def test_invalid_idle_eviction_seconds_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

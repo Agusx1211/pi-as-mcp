@@ -53,6 +53,8 @@ PROMPT_ACK_TIMEOUT_SECONDS = 30
 # worker that resumes the session by id. 0 disables eviction (workers stay
 # resident until an explicit stop or parent death). Eviction only applies when
 # session persistence is enabled (a session_dir is configured).
+# Tradeoff: a resumed reply pays a cold cost (respawn pi + replay the on-disk
+# session); raise this (or set 0) for interactive use, keep it low for fan-out.
 DEFAULT_IDLE_EVICTION_SECONDS = 120
 
 # (agent_id, record) -> None. Receives full-fidelity transcript records.
@@ -1038,7 +1040,13 @@ class PiAgentSession:
             self._notify_observer(*observer_event)
         self._persist_transcript_event(event_type, event, turn=turn_for_record)
 
-    def _snapshot_locked(self, *, include_events: bool | None = None) -> SessionSnapshot:
+    def _derive_status_locked(self) -> str:
+        """Compute the derived status string without building a snapshot.
+
+        Single source of truth for status derivation; ``_snapshot_locked`` and
+        the lightweight status accessors all use it so the result stays
+        byte-for-byte identical across callers.
+        """
         status = self._status
         process = self.process
         process_dead = process is None or process.poll() is not None
@@ -1056,6 +1064,28 @@ class PiAgentSession:
             status = "running"
         elif status in {"starting", "running"}:
             status = "idle"
+        return status
+
+    def _status_info_locked(self) -> tuple[str, str, str]:
+        """Return ``(status, model, provider)`` without copying any lists.
+
+        Cheap accessor for hot paths (e.g. the concurrency check) that only
+        need the derived status and model/provider identity rather than a full
+        ``SessionSnapshot``.
+        """
+        return (
+            self._derive_status_locked(),
+            self.model_spec.model,
+            self.model_spec.provider,
+        )
+
+    def status_info(self) -> tuple[str, str, str]:
+        """Locked public accessor for ``(status, model, provider)``."""
+        with self._lock:
+            return self._status_info_locked()
+
+    def _snapshot_locked(self, *, include_events: bool | None = None) -> SessionSnapshot:
+        status = self._derive_status_locked()
 
         return SessionSnapshot(
             agent_id=self.agent_id,
@@ -1079,7 +1109,7 @@ class PiAgentSession:
         )
 
     def _summary_locked(self) -> SessionSummary:
-        status = self._snapshot_locked(include_events=False).status
+        status = self._derive_status_locked()
         now = time.monotonic()
         return SessionSummary(
             agent_id=self.agent_id,
@@ -1549,12 +1579,12 @@ class SessionManager:
 
         count = 0
         for session in sessions:
-            snapshot = session.snapshot(include_events=False)
-            if snapshot.status not in CONCURRENCY_COUNTED_STATUSES:
+            session_status, session_model, session_provider = session.status_info()
+            if session_status not in CONCURRENCY_COUNTED_STATUSES:
                 continue
-            if snapshot.model != model:
+            if session_model != model:
                 continue
-            if match_provider and snapshot.provider != provider:
+            if match_provider and session_provider != provider:
                 continue
             count += 1
         return count

@@ -232,6 +232,12 @@ class DaemonState:
         self._lock = threading.RLock()
         self._managers: dict[str, SessionManager] = {}
         self._identities: dict[str, ParentIdentity] = {}
+        # In-flight concurrency reservations, keyed by (provider, model). A start
+        # reserves a slot under the lock, then spawns the Pi worker *outside* the
+        # lock (so other commands aren't blocked by the ~1.5s subprocess spawn).
+        # The reservation keeps the limit honest during that window, before the
+        # session is registered with its manager and visible to active counts.
+        self._pending_starts: dict[tuple[str, str], int] = {}
         self._stats = StatsStore()
         self._closed = False
         self._reaper = threading.Thread(target=self._reap_closed_parents, daemon=True)
@@ -269,15 +275,21 @@ class DaemonState:
         tool_mode: ToolMode,
         include_events: bool,
     ) -> dict[str, Any]:
+        model_spec = resolve_model(model, provider)
+        config = load_config()
+        # Hold the lock only long enough to atomically resolve the manager and
+        # reserve a concurrency slot; release it before the expensive worker spawn
+        # so peeks/listens/other delegates aren't serialized behind this start.
         with self._lock:
             manager = self.manager_for(identity)
-            model_spec = resolve_model(model, provider)
-            config = load_config()
             self._enforce_concurrency_limits_locked(
                 config,
                 provider=model_spec.provider,
                 model=model_spec.model,
             )
+            self._reserve_start_locked(model_spec.provider, model_spec.model)
+
+        try:
             snapshot = manager.start(
                 prompt=prompt,
                 cwd=cwd,
@@ -287,13 +299,20 @@ class DaemonState:
                 include_events=include_events,
                 unsafe_read_only=config.agents.unsafe_read_only,
             )
-            data = snapshot.to_json(verbosity="normal")
-            self._record_agent_snapshot(
-                event_type="agent_started",
-                snapshot=data,
-                identity=identity,
-            )
-            return snapshot.to_json(verbosity="summary")
+        finally:
+            # The session (if started) is now registered with its manager and
+            # counted by active_model_count, so the reservation can drop. On
+            # failure this still frees the slot we held.
+            with self._lock:
+                self._release_start_locked(model_spec.provider, model_spec.model)
+
+        data = snapshot.to_json(verbosity="normal")
+        self._record_agent_snapshot(
+            event_type="agent_started",
+            snapshot=data,
+            identity=identity,
+        )
+        return snapshot.to_json(verbosity="summary")
 
     def record_agent_snapshot(
         self,
@@ -401,7 +420,7 @@ class DaemonState:
             )
 
     def _active_model_count_locked(self, model_limit: ModelConcurrencyLimit) -> int:
-        return sum(
+        active = sum(
             manager.active_model_count(
                 provider=model_limit.provider,
                 model=model_limit.model,
@@ -409,6 +428,29 @@ class DaemonState:
             )
             for manager in self._managers.values()
         )
+        return active + self._pending_start_count_locked(model_limit)
+
+    def _pending_start_count_locked(self, model_limit: ModelConcurrencyLimit) -> int:
+        total = 0
+        for (provider, model), count in self._pending_starts.items():
+            if model != model_limit.model:
+                continue
+            if model_limit.match_provider and provider != model_limit.provider:
+                continue
+            total += count
+        return total
+
+    def _reserve_start_locked(self, provider: str, model: str) -> None:
+        key = (provider, model)
+        self._pending_starts[key] = self._pending_starts.get(key, 0) + 1
+
+    def _release_start_locked(self, provider: str, model: str) -> None:
+        key = (provider, model)
+        remaining = self._pending_starts.get(key, 0) - 1
+        if remaining > 0:
+            self._pending_starts[key] = remaining
+        else:
+            self._pending_starts.pop(key, None)
 
     def _record_agent_snapshot(
         self,

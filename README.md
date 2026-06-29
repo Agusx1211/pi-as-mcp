@@ -203,6 +203,23 @@ than by the total number of delegations. Set `idle_eviction_seconds` to `0` to
 keep idle workers resident, or `persist_sessions: false` to disable persistence
 entirely.
 
+**Latency vs. memory tradeoff.** Eviction trades reply latency for reclaimed
+memory. A resumed reply to an evicted worker pays a cold cost: respawning the
+`pi` subprocess (a fresh node boot, ~0.7s) *plus* replaying the entire on-disk
+session so Pi can rebuild context. For interactive, conversational use where
+replies arrive after pauses longer than the timeout, every reply eats that
+penalty — raise `idle_eviction_seconds` (or set it to `0`) so workers stay warm
+between turns. For fire-and-forget fan-out where you rarely reply, keep it low
+to reclaim memory quickly. Tune it via config:
+
+```json
+{
+  "agents": {
+    "idle_eviction_seconds": 0
+  }
+}
+```
+
 ## Model Configuration
 
 The primary source of truth is Pi's settings file:
@@ -264,6 +281,10 @@ block new delegations.
   }
 }
 ```
+
+`idle_eviction_seconds` is the latency/memory knob described under
+[Idle Worker Eviction](#idle-worker-eviction): raise it (or `0`) for interactive
+sessions to avoid cold respawn + session replay, keep it low for fan-out.
 
 ### Unsafe Read-Only
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
+import pi_as_mcp.pi_rpc as pi_rpc
 from pi_as_mcp.pi_rpc import (
     READ_ONLY_GUARD,
     TOOL_PROFILES,
@@ -9,6 +12,7 @@ from pi_as_mcp.pi_rpc import (
     PiRpcRunner,
     assistant_message_text,
     guard_prompt,
+    load_pi_settings,
     model_context_tokens,
     model_row_visible,
     parse_context_tokens,
@@ -141,6 +145,45 @@ def test_missing_model_config_has_no_personal_fallback(
         resolve_model(None, None)
 
 
+def test_load_pi_settings_caches_until_file_changes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"defaultProvider": "mistral"}', encoding="utf-8")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    parse_calls = 0
+    real_loads = pi_rpc.json.loads
+
+    def counting_loads(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_loads(*args, **kwargs)
+
+    monkeypatch.setattr(pi_rpc.json, "loads", counting_loads)
+
+    first = load_pi_settings()
+    assert first == {"defaultProvider": "mistral"}
+    # Unchanged file: served from cache, no re-parse.
+    second = load_pi_settings()
+    assert second == {"defaultProvider": "mistral"}
+    assert parse_calls == 1
+
+    # A real change on disk (different content + size) must be picked up.
+    settings.write_text('{"defaultProvider": "openai", "defaultModel": "gpt"}', encoding="utf-8")
+    third = load_pi_settings()
+    assert third == {"defaultProvider": "openai", "defaultModel": "gpt"}
+    assert parse_calls == 2
+
+
+def test_load_pi_settings_caches_missing_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    assert load_pi_settings() == {}
+    # Creating the file afterwards is detected (cached miss is re-checked via stat).
+    (tmp_path / "settings.json").write_text('{"defaultProvider": "x"}', encoding="utf-8")
+    assert load_pi_settings() == {"defaultProvider": "x"}
+
+
 def test_build_args_limits_read_only_tools() -> None:
     runner = PiRpcRunner(pi_bin="pi")
     args = runner._build_args("local", "example-model", "read-only")
@@ -166,3 +209,62 @@ def test_guard_prompt_prepends_active_guard() -> None:
     assert guarded.endswith("inspect the dirty changes")
 
     assert guard_prompt(None, "inspect the dirty changes") == "inspect the dirty changes"
+
+
+def _fake_list_models(stdout: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["pi", "--offline", "--list-models", "example-model"],
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+
+
+def test_validate_model_caches_and_skips_second_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = PiRpcRunner(pi_bin="pi")
+    listing = """provider   model                    context
+local  example-model  128K
+"""
+    calls = 0
+
+    def fake_list_models(search: str, *, timeout_seconds: int = 15) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        return _fake_list_models(listing)
+
+    monkeypatch.setattr(runner, "list_models", fake_list_models)
+
+    first = runner.validate_model("local", "example-model")
+    second = runner.validate_model("local", "example-model")
+
+    assert first == 128_000
+    assert second == 128_000
+    # Second validation of the same (provider, model) is served from cache.
+    assert calls == 1
+
+
+def test_validate_model_does_not_cache_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = PiRpcRunner(pi_bin="pi")
+    calls = 0
+
+    def failing_list_models(search: str, *, timeout_seconds: int = 15) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            args=["pi", "--offline", "--list-models", search],
+            returncode=1,
+            stdout="",
+            stderr="boom",
+        )
+
+    monkeypatch.setattr(runner, "list_models", failing_list_models)
+
+    with pytest.raises(PiRpcError):
+        runner.validate_model("local", "example-model")
+    with pytest.raises(PiRpcError):
+        runner.validate_model("local", "example-model")
+
+    # Transient failures are retried, not cached.
+    assert calls == 2

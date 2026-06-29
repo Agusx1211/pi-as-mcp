@@ -816,3 +816,100 @@ while True:
     assert final.active_listeners == 0
     assert final.to_json(verbosity="summary")["observing_with_piw"] is False
     manager.close()
+
+
+def test_status_info_matches_snapshot_and_active_count(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(
+        tmp_path,
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("type") == "abort":
+        break
+    text = request.get("message", "")
+    print(json.dumps({"id": request["id"], "type": "response", "command": "prompt", "success": True}), flush=True)
+    message = {"role": "assistant", "content": [{"type": "text", "text": "echo:" + text}], "responseId": "r-" + text}
+    print(json.dumps({"type": "message_end", "message": message}), flush=True)
+    print(json.dumps({"type": "agent_end", "messages": [message]}), flush=True)
+""",
+    )
+
+    manager = SessionManager()
+    manager._runner.pi_bin = str(fake_pi)
+    started = manager.start(
+        prompt="hi",
+        cwd=str(tmp_path),
+        model="local/example-model",
+        provider=None,
+        tool_mode="none",
+        include_events=False,
+    )
+    manager.listen(started.agent_id, after_turn_count=0, timeout_seconds=5)
+
+    session = manager._sessions[started.agent_id]
+
+    # Drive the session through every status-derivation branch and confirm the
+    # lightweight accessor stays byte-for-byte identical to the full snapshot.
+    def assert_consistent() -> None:
+        with session._lock:
+            status, model, provider = session._status_info_locked()
+            snapshot = session._snapshot_locked(include_events=False)
+        assert status == snapshot.status
+        assert model == snapshot.model
+        assert provider == snapshot.provider
+        assert session.status_info() == (snapshot.status, snapshot.model, snapshot.provider)
+
+    # idle (starting/running -> idle)
+    assert_consistent()
+    assert session.status_info()[0] == "idle"
+
+    # running
+    with session._lock:
+        session._running = True
+    assert_consistent()
+    assert session.status_info()[0] == "running"
+    with session._lock:
+        session._running = False
+
+    # evicted -> idle
+    with session._lock:
+        session._evicted = True
+    assert_consistent()
+    assert session.status_info()[0] == "idle"
+    with session._lock:
+        session._evicted = False
+
+    # closed + stopped -> stopped
+    with session._lock:
+        session._closed = True
+        session._status = "stopped"
+    assert_consistent()
+    assert session.status_info()[0] == "stopped"
+    with session._lock:
+        session._closed = False
+        session._status = "idle"
+
+    # active_model_count counts only starting/running sessions.
+    assert manager.active_model_count(
+        provider="local", model="example-model", match_provider=False
+    ) == 0
+    with session._lock:
+        session._running = True
+    assert manager.active_model_count(
+        provider="local", model="example-model", match_provider=False
+    ) == 1
+    assert manager.active_model_count(
+        provider="local", model="other-model", match_provider=False
+    ) == 0
+    with session._lock:
+        session._running = False
+
+    manager.close()
