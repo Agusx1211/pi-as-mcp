@@ -4,7 +4,7 @@ import json
 
 import anyio
 
-from pi_as_mcp import server
+from pi_as_mcp import server, skill
 from pi_as_mcp.server import mcp
 
 
@@ -37,7 +37,11 @@ def test_mcp_surface_is_small_and_structured() -> None:
             for field in {"tool_calls", "stderr_tail", "event_tail"}:
                 assert schema["properties"][field]["type"] == "array"
                 assert "default" not in schema["properties"][field]
-        assert await mcp.list_resources() == []
+        # The only resource is the MCP-provided "cheap sub-agents" skill.
+        resources = await mcp.list_resources()
+        assert len(resources) == 1
+        assert resources[0].name == "cheap-subagents"
+        assert str(resources[0].uri) == skill.SKILL_RESOURCE_URI
         assert await mcp.list_resource_templates() == []
         assert await mcp.list_prompts() == []
 

@@ -30,6 +30,21 @@ def hash_scope(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def exposed_model_aliases() -> list[dict[str, Any]]:
+    """Pi-enabled models pi-as-mcp exposes: disabled ones dropped, descriptions added."""
+    agents = load_config().agents
+    rows: list[dict[str, Any]] = []
+    for alias in PiRpcRunner().model_aliases():
+        provider = str(alias.get("provider") or "")
+        model = str(alias.get("model") or "")
+        if agents.is_model_disabled(provider=provider, model=model):
+            continue
+        rows.append(
+            {**alias, "description": agents.description_for_model(provider=provider, model=model)}
+        )
+    return rows
+
+
 def proc_stat(pid: int) -> tuple[int | None, str | None]:
     try:
         content = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
@@ -282,6 +297,11 @@ class DaemonState:
         # so peeks/listens/other delegates aren't serialized behind this start.
         with self._lock:
             manager = self.manager_for(identity)
+            if config.agents.is_model_disabled(provider=model_spec.provider, model=model_spec.model):
+                raise PiRpcError(
+                    f"model {model_spec.provider}/{model_spec.model} is disabled in pi-as-mcp config; "
+                    "enable it in `pi-agent config` or choose another model"
+                )
             self._enforce_concurrency_limits_locked(
                 config,
                 provider=model_spec.provider,
@@ -725,7 +745,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
             }
 
         if command == "models":
-            return {"models": PiRpcRunner().model_aliases()}
+            return {"models": exposed_model_aliases()}
 
         if command == "health":
             return PiRpcRunner().health(

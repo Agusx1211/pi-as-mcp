@@ -76,6 +76,65 @@ class ModelSpec:
         }
 
 
+@dataclass(frozen=True)
+class CatalogModel:
+    """One row of `pi --list-models`: a model Pi can reach, enabled or not."""
+
+    provider: str
+    model: str
+    context: str = ""
+    max_out: str = ""
+    thinking: bool = False
+    images: bool = False
+
+    @property
+    def ref(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "ref": self.ref,
+            "context": self.context,
+            "max_out": self.max_out,
+            "thinking": self.thinking,
+            "images": self.images,
+        }
+
+
+def parse_model_catalog(output: str) -> list[CatalogModel]:
+    """Parse the tabular `pi --list-models` output into structured rows.
+
+    The first column header is ``provider``; that line and any blank lines are
+    skipped. Columns are whitespace-separated: provider, model, context,
+    max-out, thinking, images. Missing trailing columns default to empty/false.
+    """
+    rows: list[CatalogModel] = []
+    for line in output.splitlines():
+        columns = line.split()
+        if len(columns) < 2:
+            continue
+        if columns[0] == "provider" and columns[1] == "model":
+            continue
+        provider, model = columns[0], columns[1]
+        context = columns[2] if len(columns) > 2 else ""
+        max_out = columns[3] if len(columns) > 3 else ""
+        thinking = len(columns) > 4 and columns[4].lower() == "yes"
+        images = len(columns) > 5 and columns[5].lower() == "yes"
+        rows.append(
+            CatalogModel(
+                provider=provider,
+                model=model,
+                context=context,
+                max_out=max_out,
+                thinking=thinking,
+                images=images,
+            )
+        )
+    return rows
+
+
 @dataclass
 class ToolCall:
     id: str | None
@@ -474,17 +533,34 @@ class PiRpcRunner:
             )
         return context_tokens
 
-    def list_models(self, search: str, *, timeout_seconds: int = 15) -> subprocess.CompletedProcess[str]:
+    def list_models(self, search: str = "", *, timeout_seconds: int = 15) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PI_OFFLINE"] = "1"
+        args = [self.pi_bin, "--offline", "--list-models"]
+        if search:
+            args.append(search)
         return subprocess.run(
-            [self.pi_bin, "--offline", "--list-models", search],
+            args,
             env=env,
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
             check=False,
         )
+
+    def list_catalog(self, *, timeout_seconds: int = 15) -> list[CatalogModel]:
+        """Every model Pi can reach (the full `--list-models` catalog).
+
+        This is the auto-discovery source for the config UI: it is independent
+        of which models are enabled in Pi settings or in pi-as-mcp config.
+        """
+        listing = self.list_models(timeout_seconds=timeout_seconds)
+        if listing.returncode != 0:
+            raise PiRpcError(
+                f"pi --list-models failed with code {listing.returncode}: "
+                f"{listing.stderr.strip() or listing.stdout.strip()}"
+            )
+        return parse_model_catalog(listing.stdout)
 
     def _build_args(
         self,

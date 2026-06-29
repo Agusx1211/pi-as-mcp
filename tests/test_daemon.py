@@ -10,8 +10,42 @@ from pathlib import Path
 
 import pytest
 
-from pi_as_mcp.daemon import DaemonState, ParentIdentity, agent_spawn_rank
+from pi_as_mcp.daemon import (
+    DaemonState,
+    ParentIdentity,
+    agent_spawn_rank,
+    exposed_model_aliases,
+)
 from pi_as_mcp.pi_rpc import PiRpcError
+
+
+def test_exposed_model_aliases_drops_disabled_and_adds_description(tmp_path, monkeypatch) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"defaultProvider": "local", "enabledModels": ["local/alpha", "local/beta"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "models": {
+                        "local/alpha": {"disabled": True},
+                        "local/beta": {"description": "the good one"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+
+    rows = exposed_model_aliases()
+    refs = {f"{r['provider']}/{r['model']}" for r in rows}
+    assert refs == {"local/beta"}  # disabled alpha is hidden
+    assert rows[0]["description"] == "the good one"
 
 
 def write_config(tmp_path: Path, model_limits: dict[str, int]) -> Path:
@@ -412,6 +446,32 @@ def test_daemon_global_summary_orders_latest_spawn_first(tmp_path: Path) -> None
         agents = state.global_summary()
         assert [agent["agent_id"] for agent in agents[:2]] == [second.agent_id, first.agent_id]
         assert agents[0]["created_at"] > agents[1]["created_at"]
+    finally:
+        state.close()
+
+
+def test_daemon_rejects_delegation_to_disabled_model(tmp_path: Path, monkeypatch) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"agents": {"models": {"local/example-model": {"disabled": True}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="scope", owner_pid=None, label="caller")
+    try:
+        state.manager_for(identity)._runner.pi_bin = str(fake_pi)
+        with pytest.raises(PiRpcError, match="disabled in pi-as-mcp config"):
+            state.start(
+                identity,
+                prompt="hi",
+                cwd=str(tmp_path),
+                model="local/example-model",
+                provider=None,
+                tool_mode="none",
+                include_events=False,
+            )
     finally:
         state.close()
 

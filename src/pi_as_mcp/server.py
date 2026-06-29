@@ -5,15 +5,16 @@ import shlex
 import shutil
 import sys
 import uuid
-from typing import Any, TypedDict, cast
+from typing import Any, NotRequired, TypedDict, cast
 
 from mcp.server.fastmcp import FastMCP
 
 from pi_as_mcp.config import load_config
-from pi_as_mcp.pi_rpc import ToolMode
+from pi_as_mcp.pi_rpc import PiRpcError, ToolMode
 from pi_as_mcp.daemon_client import DaemonClient
 from pi_as_mcp.paths import runtime_dir
 from pi_as_mcp.sessions import ReplyBehavior, ResponseVerbosity
+from pi_as_mcp import skill
 
 mcp = FastMCP("pi-as-mcp")
 client = DaemonClient(default_parent_hint=f"mcp:{uuid.uuid4().hex}", parent_owner_pid=os.getpid())
@@ -45,6 +46,7 @@ class ModelAlias(TypedDict):
     alias: str
     provider: str
     model: str
+    description: NotRequired[str]
 
 
 class ModelsResult(TypedDict):
@@ -286,13 +288,40 @@ def agent_stop(agent_id: str, verbosity: ResponseVerbosity = "summary") -> Sessi
 
 @mcp.tool()
 def models() -> ModelsResult:
-    """List models enabled in Pi settings."""
+    """List sub-agent models pi-as-mcp exposes (Pi-enabled minus disabled)."""
 
     return cast(ModelsResult, client.request("models"))
 
 
+@mcp.resource(
+    skill.SKILL_RESOURCE_URI,
+    name="cheap-subagents",
+    title="Cheap sub-agents (pi-as-mcp)",
+    description="How and when to delegate bounded tasks to cheaper Pi sub-agent models.",
+    mime_type="text/markdown",
+)
+def cheap_subagents_skill() -> str:
+    """Live-rendered skill: intro + auto-generated model roster + usage."""
+
+    return skill.render_skill_body()
+
+
+def sync_server_instructions() -> None:
+    """Publish the generated skill as the MCP server's instructions.
+
+    Read live at startup so the always-in-context instructions reflect the
+    current config and Pi roster. Best-effort: a failure must not stop the
+    server from serving its tools.
+    """
+    try:
+        mcp._mcp_server.instructions = skill.render_server_instructions()
+    except (PiRpcError, OSError):
+        pass
+
+
 def main() -> None:
     sync_score_tool()
+    sync_server_instructions()
     mcp.run()
 
 

@@ -5,7 +5,7 @@ import json
 import pytest
 
 import pi_as_mcp.config as config_module
-from pi_as_mcp.config import load_config
+from pi_as_mcp.config import load_config, load_raw_config, save_raw_config
 from pi_as_mcp.pi_rpc import PiRpcError
 
 
@@ -161,3 +161,74 @@ def test_invalid_idle_eviction_seconds_is_rejected(tmp_path, monkeypatch: pytest
 
     with pytest.raises(PiRpcError, match="idle_eviction_seconds"):
         load_config()
+
+
+def test_model_map_parses_limit_disabled_description(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "models": {
+                        "local/example-model": {"limit": 2, "disabled": True, "description": "scout"},
+                        "bare-model": 5,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+
+    agents = load_config().agents
+    assert agents.is_model_disabled(provider="local", model="example-model") is True
+    assert agents.description_for_model(provider="local", model="example-model") == "scout"
+    full = agents.concurrency_limit_for_model(provider="local", model="example-model")
+    assert full is not None and full.limit == 2
+    # Integer shorthand is sugar for a concurrency limit on a bare model name.
+    bare = agents.concurrency_limit_for_model(provider="any", model="bare-model")
+    assert bare is not None and bare.limit == 5 and bare.match_provider is False
+
+
+def test_legacy_concurrency_limits_still_load(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"agents": {"concurrency_limits": {"models": {"local/example-model": 3}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    agents = load_config().agents
+    limit = agents.concurrency_limit_for_model(provider="local", model="example-model")
+    assert limit is not None and limit.limit == 3
+    assert agents.model_concurrency_limits == {"local/example-model": 3}
+
+
+def test_skill_config_parses(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"skill": {"intro": "hi"}}), encoding="utf-8")
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    assert load_config().skill.intro == "hi"
+
+
+def test_invalid_disabled_flag_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"agents": {"models": {"local/x": {"disabled": "yes"}}}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    with pytest.raises(PiRpcError, match="disabled must be a boolean"):
+        load_config()
+
+
+def test_save_raw_config_round_trips_and_validates(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+
+    payload = {"agents": {"unsafe_read_only": True, "models": {"local/x": {"limit": 1}}}}
+    save_raw_config(payload)
+    assert load_raw_config() == payload
+    assert load_config().agents.unsafe_read_only is True
+
+    # A payload the daemon would reject is refused at save time.
+    with pytest.raises(PiRpcError):
+        save_raw_config({"agents": {"models": {"local/x": {"limit": 0}}}})

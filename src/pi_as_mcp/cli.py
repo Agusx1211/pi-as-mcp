@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from pi_as_mcp.daemon_client import DaemonClient, DaemonClientError
+from pi_as_mcp.pi_rpc import PiRpcError
 
 
 def print_json(data: dict[str, Any]) -> None:
@@ -122,6 +123,8 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("--scoped", action="store_true", help="show only agents in this CLI parent scope")
     sub.add_parser("models", help="list Pi-enabled models")
     sub.add_parser("tui", help="open the interactive local agent TUI")
+    sub.add_parser("config", help="open the interactive config editor TUI")
+    sub.add_parser("skill", help="print the MCP-provided sub-agents skill (as the server renders it)")
 
     health = sub.add_parser("health", help="check Pi backend")
     health.add_argument("--model")
@@ -201,6 +204,14 @@ def main() -> None:
             from pi_as_mcp.tui import run_tui
 
             run_tui()
+        elif command == "config":
+            from pi_as_mcp.config_tui import run_config_tui
+
+            run_config_tui()
+        elif command == "skill":
+            from pi_as_mcp import skill as skill_mod
+
+            print(skill_mod.render_skill_body())
         elif command == "health":
             print_json(
                 client.request(
@@ -210,7 +221,7 @@ def main() -> None:
                     timeout_seconds=args.timeout_seconds,
                 )
             )
-    except DaemonClientError as exc:
+    except (DaemonClientError, PiRpcError) as exc:
         print_json({"error": str(exc)})
         sys.exit(1)
 

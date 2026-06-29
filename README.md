@@ -83,10 +83,13 @@ The MCP surface is intentionally small:
 | `agent_reply` | Send another prompt to an existing session |
 | `agent_peek` | Return the latest state without waiting |
 | `agent_stop` | Abort and remove a session |
-| `models` | List configured models |
+| `models` | List exposed models (Pi-enabled minus disabled), with descriptions |
 | `score` | Rate a completed sub-agent (when enabled) |
 
-There are no MCP resources, resource templates, or prompts.
+The server also publishes a single MCP **resource**,
+`skill://pi-as-mcp/cheap-subagents`, and sets its MCP **instructions** to a
+compact version of the same content. Both are generated live from config + the
+Pi catalog (see [Skill](#skill)). There are no resource templates or prompts.
 
 ### `delegate`
 
@@ -149,6 +152,8 @@ piw <agent_id>
 pi-agent reply <agent_id> "now check pyproject.toml"
 pi-agent stop <agent_id>
 pi-agent tui
+pi-agent config
+pi-agent skill          # print the MCP-provided skill
 ```
 
 `pi-agent list` is an alias for `pi-agent summary`. By default it shows all
@@ -156,6 +161,9 @@ live agents across parent scopes. Pass `--scoped` to show only agents in the
 current CLI parent scope.
 
 `pi-agent tui` / `pi-agent-tui` opens the interactive dashboard shown above.
+
+`pi-agent config` / `pi-agent-config` opens the interactive config editor (see
+[Skill](#skill)).
 
 ## Architecture
 
@@ -252,24 +260,39 @@ The daemon reads optional settings from a single user-global file:
 There is no per-project config. Set `PI_AS_MCP_CONFIG=/path/to/config.json` to
 use an explicit path.
 
-### Concurrency Limits
+### Per-Model Settings
+
+Each model pi-as-mcp can use gets an optional entry under `agents.models`, keyed
+by a fully qualified `provider/model` ref or a bare model name:
 
 ```json
 {
   "agents": {
-    "concurrency_limits": {
-      "models": {
-        "provider/model-name": 2,
-        "model-name": 4
-      }
+    "models": {
+      "provider/model-name": {
+        "limit": 2,
+        "disabled": false,
+        "description": "Lower-tier scout — research and exploration only."
+      },
+      "model-name": 4
     }
   }
 }
 ```
 
-Fully qualified keys limit that provider/model pair. Bare keys limit across
-providers. Only `starting` and `running` agents count — idle agents do not
-block new delegations.
+- **`limit`** — max concurrent `starting`/`running` agents for this model. Idle
+  agents do not count. Fully qualified keys limit that provider/model pair; bare
+  keys limit across providers. The integer shorthand (`"model-name": 4`) is sugar
+  for `{ "limit": 4 }`.
+- **`disabled`** — when `true`, the model is hidden from the `models` tool and
+  the skill, and delegation to it is rejected, even though it stays enabled in
+  Pi. Use this to expose a subset of Pi's `enabledModels`.
+- **`description`** — short human-written guidance/rules for the model, surfaced
+  verbatim in the generated skill.
+
+The legacy `agents.concurrency_limits.models` map (flat `ref → int`) is still
+read and folded in. The easiest way to manage all of this is `pi-agent config`
+(see [Skill](#skill)).
 
 ### Session Persistence
 
@@ -300,6 +323,47 @@ trusted models. For tasks that need shell access, use `tool_mode="full"`.
 Set `agents.enable_score` to `true` to expose the optional `score` MCP tool.
 Scores are 1–10 (>5 net-positive, <5 net-negative). When enabled, completed
 wait/listen responses include a nudge asking the parent to rate the sub-agent.
+
+## Skill
+
+pi-as-mcp ships a "cheap sub-agents" skill that teaches a parent agent when and
+how to delegate. It is **MCP-provided**: the running server publishes it as the
+`skill://pi-as-mcp/cheap-subagents` resource and as the server's MCP
+instructions, so any MCP host (Claude Code, Codex, …) picks it up with no
+install and no on-disk files.
+
+It is **generated**, not hand-written: the model roster is Pi's enabled models
+minus the ones disabled in config, annotated with each model's configured
+description, concurrency limit, and discovered capabilities (context window,
+thinking). Only the intro prose is yours to customize.
+
+`pi-agent skill` prints the skill exactly as the server renders it.
+
+### Config editor
+
+```bash
+pi-agent config        # or: pi-agent-config
+```
+
+The TUI auto-discovers every model in `pi --list-models` and lets you, per
+model: set a concurrency limit (`l`), write a description/rules (`e`), or disable
+it (`d`). It also toggles the global settings — unsafe read-only (`u`), scoring
+(`c`), session persistence (`p`), idle eviction (`i`) — and edits the skill
+intro (`t`). It flags any config entry for a model Pi no longer knows about.
+Press `w` to save. The server reflects saved changes on its next read (the
+resource is live; the always-in-context instructions refresh on reconnect).
+
+The custom intro lives under a `skill` block in the config:
+
+```json
+{
+  "skill": {
+    "intro": "Your custom prose for the top of the skill..."
+  }
+}
+```
+
+An empty `intro` falls back to the built-in default.
 
 ### Stats and Transcripts
 

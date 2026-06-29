@@ -29,6 +29,7 @@ pi-as-mcp = "pi_as_mcp.server:main"
 pi-agent = "pi_as_mcp.cli:main"
 pi-agent-daemon = "pi_as_mcp.daemon:main"
 pi-agent-tui = "pi_as_mcp.tui:main"
+pi-agent-config = "pi_as_mcp.config_tui:main"
 piw = "pi_as_mcp.cli:wait_main"
 
 [dependency-groups]

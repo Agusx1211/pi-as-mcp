@@ -16,9 +16,25 @@ from pi_as_mcp.pi_rpc import (
     model_context_tokens,
     model_row_visible,
     parse_context_tokens,
+    parse_model_catalog,
     resolve_model,
     validate_tool_mode,
 )
+
+
+def test_parse_model_catalog_reads_rows_and_capabilities() -> None:
+    output = """provider   model                     context  max-out  thinking  images
+macstudio  qwen3.6-35b-a3b-mtp       262.1K   16.4K    yes       yes
+mistral    open-mistral-7b           8K       8K       no        no
+"""
+    catalog = parse_model_catalog(output)
+    assert [c.ref for c in catalog] == ["macstudio/qwen3.6-35b-a3b-mtp", "mistral/open-mistral-7b"]
+    qwen = catalog[0]
+    assert qwen.context == "262.1K"
+    assert qwen.thinking is True
+    assert qwen.images is True
+    assert catalog[1].thinking is False
+    assert catalog[1].images is False
 
 
 def test_model_row_visible_exact_match() -> None:
