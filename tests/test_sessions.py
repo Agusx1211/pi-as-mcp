@@ -7,7 +7,33 @@ import threading
 import time
 from pathlib import Path
 
-from pi_as_mcp.sessions import SessionManager
+from pi_as_mcp.sessions import SessionManager, extract_message_update_parts
+
+
+def test_extract_message_update_parts_assistant_message_event_envelope() -> None:
+    # Providers that wrap deltas in an ``assistantMessageEvent`` envelope and
+    # carry the characters in ``content`` must still be parsed, otherwise a long
+    # pure-reasoning generation streams with zero extracted activity and the
+    # inactivity watchdog kills it mid-thought (the qwen-MTP stall bug).
+    think = {
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "content": "reasoning"},
+    }
+    assert extract_message_update_parts(think) == ("", "reasoning")
+
+    answer = {
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "content": "answer"},
+    }
+    assert extract_message_update_parts(answer) == ("answer", "")
+
+    # Legacy delta shape still works.
+    legacy = {"type": "message_update", "delta": {"type": "thinking_delta", "text": "ponder"}}
+    assert extract_message_update_parts(legacy) == ("", "ponder")
+
+    # An event with no character payload yields nothing (no false activity).
+    empty = {"type": "message_update", "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}}
+    assert extract_message_update_parts(empty) == ("", "")
 
 
 def write_fake_pi(tmp_path: Path, body: str) -> Path:

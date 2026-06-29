@@ -102,7 +102,11 @@ def _accumulate_message_update_parts(value: Any, parts: dict[str, list[str]], *,
 
     Pi tags each delta with a ``type`` (``text_delta`` / ``thinking_delta``) and
     carries the actual characters in ``text``, so the channel is decided by the
-    nearest ``type`` field, not by the key the string lives under.
+    nearest ``type`` field, not by the key the string lives under. Some providers
+    instead wrap the delta in an ``assistantMessageEvent`` envelope and carry the
+    characters in ``content`` (e.g. ``{"type": "message_update",
+    "assistantMessageEvent": {"type": "thinking_delta", "content": "..."}}``), so
+    we descend into that envelope and treat a string ``content`` as a delta too.
     """
     if isinstance(value, str):
         parts["thinking" if thinking else "text"].append(value)
@@ -136,8 +140,11 @@ def _accumulate_message_update_parts(value: Any, parts: dict[str, list[str]], *,
     reasoning = value.get("thinking")
     if isinstance(reasoning, str):
         parts["thinking"].append(reasoning)
+    content = value.get("content")
+    if isinstance(content, str):
+        parts["thinking" if local_thinking else "text"].append(content)
 
-    for nested_key in ("delta", "content"):
+    for nested_key in ("delta", "content", "assistantMessageEvent"):
         nested = value.get(nested_key)
         if isinstance(nested, dict | list):
             _accumulate_message_update_parts(nested, parts, thinking=local_thinking)
@@ -1164,6 +1171,12 @@ class PiAgentSession:
         if text:
             self._append_stream_delta_locked("message_stream", text)
             self._touch_locked("receiving assistant message")
+        if not thinking and not text:
+            # A streamed message_update means the model is actively producing
+            # output even if we couldn't extract characters from this event's
+            # shape (provider schema drift). Count it as activity so the
+            # inactivity watchdog never starves mid-stream on a long generation.
+            self._touch_locked("streaming")
 
     def _append_stream_delta_locked(self, kind: str, text: str) -> None:
         turn = self._turn_count + 1
