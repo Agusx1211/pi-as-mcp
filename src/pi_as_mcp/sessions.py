@@ -44,7 +44,25 @@ CONCURRENCY_COUNTED_STATUSES = {"starting", "running"}
 # Turns are bounded by inactivity, not wall-clock: a turn that keeps streaming
 # tokens, calling tools, or returning results stays alive indefinitely; only a
 # running turn that produces nothing for this long is treated as stalled.
-DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 600
+#
+# The one fully-silent window is *prompt processing* (prefill) before the first
+# token streams back. Local models running at the edge of a machine's capability
+# can spend many minutes there, so this is generous (60 min) to avoid killing a
+# healthy worker mid-prefill — which the model server logs as "Client
+# disconnected. Stopping generation". Override via PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS.
+def _default_inactivity_timeout_seconds() -> float:
+    raw = os.environ.get("PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 3600.0
+
+
+DEFAULT_INACTIVITY_TIMEOUT_SECONDS = _default_inactivity_timeout_seconds()
 # Separate, short bound for the prompt-accept handshake (Pi acks immediately).
 PROMPT_ACK_TIMEOUT_SECONDS = 30
 # How long a worker may sit idle (turn finished, awaiting a possible follow-up)
@@ -664,6 +682,20 @@ class PiAgentSession:
         )
         env = os.environ.copy()
         env["PI_OFFLINE"] = "1"
+        # Lift undici's default 300s read timeouts in the Node worker so a long
+        # prompt-processing (prefill) phase on a slow local model doesn't abort the
+        # HTTP request mid-generation (server-side "Client disconnected"). The
+        # preload resolves undici from Pi's own node_modules via PI_FETCH_DISPATCH_BASE.
+        preload = Path(__file__).resolve().parent / "assets" / "disable_fetch_timeouts.mjs"
+        if preload.is_file():
+            env["PI_FETCH_DISPATCH_BASE"] = self.runner.pi_bin
+            import_flag = f"--import={preload.as_uri()}"
+            existing_node_options = env.get("NODE_OPTIONS", "").strip()
+            env["NODE_OPTIONS"] = (
+                f"{existing_node_options} {import_flag}".strip()
+                if existing_node_options
+                else import_flag
+            )
         process: subprocess.Popen[str] = subprocess.Popen(
             args,
             cwd=str(self.cwd_path),
