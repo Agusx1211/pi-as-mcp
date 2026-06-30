@@ -1548,24 +1548,6 @@ class SessionManager:
             self._sessions[agent_id] = session
         return session.snapshot()
 
-    def _cleanup_session_files(self, agent_id: str) -> None:
-        """Delete the persisted session log(s) for a permanently-removed agent.
-
-        Pi names files ``<timestamp>_<id>.jsonl`` under per-cwd subdirs, so match
-        the agent_id anywhere in the tree. Best-effort: the session store is now
-        durable (``~/.pi-as-mcp/sessions``), so a leftover file persists until a
-        later cleanup rather than being reclaimed on reboot — it only costs disk."""
-        if self._session_dir is None:
-            return
-        try:
-            for path in self._session_dir.rglob(f"*{agent_id}*.jsonl"):
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
-
     def reply(
         self,
         agent_id: str,
@@ -1599,7 +1581,6 @@ class SessionManager:
         snapshot = session.stop()
         with self._lock:
             self._sessions.pop(agent_id, None)
-        self._cleanup_session_files(agent_id)
         return snapshot
 
     def list(self) -> list[dict[str, Any]]:
@@ -1636,7 +1617,6 @@ class SessionManager:
             self._sessions.clear()
         for session in sessions:
             session._terminate(mark_status=reason)
-            self._cleanup_session_files(session.agent_id)
         return len(sessions)
 
     def _get(self, agent_id: str) -> PiAgentSession:
