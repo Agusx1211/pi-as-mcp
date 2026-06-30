@@ -1516,8 +1516,9 @@ class SessionManager:
         """Delete the persisted session log(s) for a permanently-removed agent.
 
         Pi names files ``<timestamp>_<id>.jsonl`` under per-cwd subdirs, so match
-        the agent_id anywhere in the tree. Best-effort: a leftover file only costs
-        disk and is reclaimed with the runtime dir on reboot."""
+        the agent_id anywhere in the tree. Best-effort: the session store is now
+        durable (``~/.pi-as-mcp/sessions``), so a leftover file persists until a
+        later cleanup rather than being reclaimed on reboot — it only costs disk."""
         if self._session_dir is None:
             return
         try:
