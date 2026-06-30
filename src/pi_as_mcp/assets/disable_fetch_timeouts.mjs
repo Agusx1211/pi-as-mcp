@@ -15,17 +15,25 @@
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { isAbsolute } from 'node:path';
+import { realpathSync } from 'node:fs';
+
+function asBase(p) {
+  // createRequire resolves modules relative to the *literal* path's directory and
+  // does NOT follow symlinks, so a symlinked launcher (e.g. bin/pi -> dist/cli.js)
+  // would search bin/node_modules and miss undici. realpath it to the real file so
+  // resolution happens from Pi's package (which has node_modules/undici).
+  if (!p || !isAbsolute(p)) return null;
+  try {
+    return pathToFileURL(realpathSync(p)).href;
+  } catch {
+    return pathToFileURL(p).href;
+  }
+}
 
 function resolveBase() {
-  // process.argv[1] is the absolute path to Pi's cli.js even during an --import
-  // preload, so undici resolves from Pi's own node_modules. The env var and this
-  // module's URL are fallbacks. A bare command name (e.g. "pi") is not a valid
-  // createRequire base, so only accept absolute paths / URLs.
-  const entry = process.argv[1];
-  if (entry && isAbsolute(entry)) return pathToFileURL(entry).href;
-  const env = process.env.PI_FETCH_DISPATCH_BASE;
-  if (env && isAbsolute(env)) return pathToFileURL(env).href;
-  return import.meta.url;
+  // process.argv[1] is the absolute path to Pi's launcher even during an --import
+  // preload. The env var is a fallback; this module's URL is the last resort.
+  return asBase(process.argv[1]) || asBase(process.env.PI_FETCH_DISPATCH_BASE) || import.meta.url;
 }
 
 try {
