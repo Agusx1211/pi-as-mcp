@@ -13,10 +13,23 @@
 // global symbol Symbol.for("undici.globalDispatcher.1"), which Node's built-in
 // fetch also reads, so this applies whether Pi uses global fetch or undici directly.
 import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import { isAbsolute } from 'node:path';
+
+function resolveBase() {
+  // process.argv[1] is the absolute path to Pi's cli.js even during an --import
+  // preload, so undici resolves from Pi's own node_modules. The env var and this
+  // module's URL are fallbacks. A bare command name (e.g. "pi") is not a valid
+  // createRequire base, so only accept absolute paths / URLs.
+  const entry = process.argv[1];
+  if (entry && isAbsolute(entry)) return pathToFileURL(entry).href;
+  const env = process.env.PI_FETCH_DISPATCH_BASE;
+  if (env && isAbsolute(env)) return pathToFileURL(env).href;
+  return import.meta.url;
+}
 
 try {
-  const base = process.env.PI_FETCH_DISPATCH_BASE || import.meta.url;
-  const require = createRequire(base);
+  const require = createRequire(resolveBase());
   const { setGlobalDispatcher, Agent } = require('undici');
   // 0 disables the timeout in undici. connectTimeout kept modest so a genuinely
   // unreachable host still fails fast; only the post-connect read timeouts (which

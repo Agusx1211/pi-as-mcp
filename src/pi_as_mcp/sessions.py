@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -688,7 +689,10 @@ class PiAgentSession:
         # preload resolves undici from Pi's own node_modules via PI_FETCH_DISPATCH_BASE.
         preload = Path(__file__).resolve().parent / "assets" / "disable_fetch_timeouts.mjs"
         if preload.is_file():
-            env["PI_FETCH_DISPATCH_BASE"] = self.runner.pi_bin
+            # Resolve to an absolute path so the preload's createRequire base is
+            # valid even when pi_bin is a bare command name (e.g. "pi"). The
+            # preload prefers process.argv[1] anyway; this is the fallback.
+            env["PI_FETCH_DISPATCH_BASE"] = shutil.which(self.runner.pi_bin) or self.runner.pi_bin
             import_flag = f"--import={preload.as_uri()}"
             existing_node_options = env.get("NODE_OPTIONS", "").strip()
             env["NODE_OPTIONS"] = (
