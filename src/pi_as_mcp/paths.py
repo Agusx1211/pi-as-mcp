@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat as stat_module
 from pathlib import Path
 
 DEFAULT_RUNTIME_DIR_TEMPLATE = "/tmp/pi-as-mcp-{uid}"
@@ -15,6 +16,14 @@ def runtime_dir() -> Path:
     override = os.environ.get("PI_AS_MCP_RUNTIME_DIR")
     path = Path(override).expanduser() if override else Path(DEFAULT_RUNTIME_DIR_TEMPLATE.format(uid=os.getuid()))
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The default lives in world-writable /tmp: refuse a pre-existing entry
+    # owned by another user (or a symlink), which could let them substitute or
+    # intercept the daemon socket placed inside.
+    info = path.lstat()
+    if not stat_module.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError(
+            f"refusing to use runtime dir {path}: not a directory owned by uid {os.getuid()}"
+        )
     try:
         path.chmod(0o700)
     except OSError:

@@ -88,11 +88,11 @@ def format_count(value: Any) -> str:
 
 
 def format_percent(value: Any) -> str:
+    # The daemon already normalizes context_percent to a real percentage;
+    # rescaling 0..1 values here would inflate a genuine sub-1% reading 100x.
     number = number_value(value)
     if number is None:
         return "--"
-    if 0 < number <= 1:
-        number *= 100
     return f"{number:.1f}%"
 
 
@@ -389,8 +389,12 @@ class PiAgentTui(App[None]):
         stats = stats if isinstance(stats, dict) else {}
 
         ids = [str(agent.get("agent_id") or "") for agent in agents]
-        if self.selected_agent_id in ids:
-            selected: str | None = self.selected_agent_id
+        # Remember which selection this poll was computed against, so a user
+        # selection made while the fetch is in flight isn't silently reverted
+        # at apply time.
+        basis = self.selected_agent_id
+        if basis in ids:
+            selected: str | None = basis
         else:
             selected = ids[0] if ids else None
 
@@ -411,6 +415,7 @@ class PiAgentTui(App[None]):
             "ok": True,
             "agents": agents,
             "stats": stats,
+            "basis": basis,
             "selected": selected,
             "detail": detail,
             "detail_key": detail_key,
@@ -422,9 +427,15 @@ class PiAgentTui(App[None]):
             self.stats_summary = snapshot["stats"]
             self.error = None
             self.refresh_failed = False
-            self.selected_agent_id = snapshot["selected"]
-            self.detail = snapshot["detail"]
-            self._detail_key = snapshot["detail_key"]
+            if snapshot.get("basis") == self.selected_agent_id:
+                self.selected_agent_id = snapshot["selected"]
+                self.detail = snapshot["detail"]
+                self._detail_key = snapshot["detail_key"]
+            else:
+                # The user moved the selection while this poll was in flight;
+                # keep their choice (the next poll fetches its detail) and only
+                # reconcile if the selected agent disappeared.
+                self.reconcile_selection()
         else:
             # A single slow or timed-out poll must not blank the whole dashboard
             # and then repaint it a second later (the "things keep disappearing"

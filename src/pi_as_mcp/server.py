@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import uuid
 from typing import Any, NotRequired, TypedDict, cast
@@ -94,7 +95,15 @@ def ensure_wait_shim() -> str:
     path = runtime_dir() / "piw"
     body = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -m pi_as_mcp.cli wait \"$@\"\n"
     if not path.exists() or path.read_text(encoding="utf-8") != body:
-        path.write_text(body, encoding="utf-8")
+        # Write atomically with the mode already set, so a crash can never
+        # leave a correct-looking but non-executable shim that the content
+        # check above would forever consider up to date.
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(body, encoding="utf-8")
+        tmp.chmod(0o700)
+        tmp.replace(path)
+    else:
+        # Heal shims left non-executable by older versions.
         path.chmod(0o700)
     return str(path)
 
@@ -241,10 +250,6 @@ def agent_reply(
 ) -> MonitorResult:
     """Send another prompt and return a short quiet monitor command for a background shell."""
 
-    before = client.request("peek", agent_id=agent_id, verbosity="summary")
-    after_turn_count = int(before.get("turn_count", 0))
-    was_running = before.get("status") == "running"
-
     data = client.request(
         "reply",
         request_timeout_seconds=15,
@@ -253,6 +258,11 @@ def agent_reply(
         behavior=behavior,
         verbosity="summary",
     )
+    # The daemon captures the pre-prompt state atomically under the session
+    # lock; a separate peek beforehand could race a completing turn and hand
+    # back a monitor command that is satisfied by the *previous* turn.
+    after_turn_count = int(data.get("reply_after_turn_count", data.get("turn_count", 0)))
+    was_running = bool(data.get("reply_was_running", data.get("status") == "running"))
     if was_running:
         hint = "message was sent to the running turn; waits for that turn to complete"
     else:
@@ -315,7 +325,7 @@ def sync_server_instructions() -> None:
     """
     try:
         mcp._mcp_server.instructions = skill.render_server_instructions()
-    except (PiRpcError, OSError):
+    except (PiRpcError, OSError, subprocess.SubprocessError):
         pass
 
 

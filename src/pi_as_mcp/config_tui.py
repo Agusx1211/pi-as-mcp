@@ -13,6 +13,7 @@ be unit-tested directly; :class:`PiConfigTui` is a thin widget layer over it.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -106,9 +107,12 @@ class ConfigDraft:
             )
 
         # Config keys that match no catalog model -> orphans (model removed from Pi).
+        # A key can match either as a full provider/model ref or as a bare model
+        # name — bare names may themselves contain "/" (e.g. org/model), so both
+        # checks always apply.
         orphans: dict[str, dict[str, Any]] = {}
         for key, cfg in agents.models.items():
-            known = key in catalog_refs if "/" in key else key in catalog_names
+            known = key in catalog_refs or key in catalog_names
             if known:
                 continue
             entry: dict[str, Any] = {}
@@ -200,7 +204,7 @@ def load_draft(*, runner: PiRpcRunner | None = None) -> tuple[ConfigDraft, str |
     catalog_error: str | None = None
     try:
         catalog = (runner or PiRpcRunner()).list_catalog()
-    except (PiRpcError, OSError) as exc:
+    except (PiRpcError, OSError, subprocess.SubprocessError) as exc:
         catalog_error = str(exc)
     enabled_refs = {f"{s.provider}/{s.model}" for s in configured_model_specs(require=False)}
     draft = ConfigDraft.from_sources(
@@ -320,7 +324,7 @@ class PiConfigTui(App[None]):
     def reload(self) -> None:
         try:
             self.draft, self.catalog_error = load_draft(runner=self._runner)
-        except PiRpcError as exc:
+        except (PiRpcError, OSError) as exc:
             self.draft = ConfigDraft()
             self.catalog_error = str(exc)
             self.status = f"config error: {exc}"
@@ -509,7 +513,7 @@ class PiConfigTui(App[None]):
     def _save(self) -> bool:
         try:
             path = save_raw_config(self.draft.to_payload())
-        except PiRpcError as exc:
+        except (PiRpcError, OSError) as exc:
             self.notify(f"save failed: {exc}", severity="error")
             return False
         self.draft.dirty = False

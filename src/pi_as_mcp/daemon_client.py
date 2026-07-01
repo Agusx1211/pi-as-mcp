@@ -15,6 +15,12 @@ class DaemonClientError(RuntimeError):
     pass
 
 
+class _DaemonConnectError(OSError):
+    """Connect-phase failure: the request was never delivered, so it is safe
+    to spawn the daemon and re-send. Post-connect failures must NOT be retried
+    (the daemon may already be executing a non-idempotent command)."""
+
+
 class DaemonClient:
     def __init__(self, *, default_parent_hint: str | None = None, parent_owner_pid: int | None = None) -> None:
         self.default_parent_hint = default_parent_hint
@@ -30,27 +36,44 @@ class DaemonClient:
 
         # Happy path: try the real connection directly instead of probing with a
         # throwaway socket first. Only spawn+wait for the daemon when the connect
-        # actually fails, then retry once.
+        # itself fails (request never delivered), then retry once. A failure
+        # after connect is NOT retried: commands like delegate/reply are not
+        # idempotent and the daemon may already be executing the first send.
         try:
             chunks = self._send(payload, request_timeout_seconds)
-        except OSError:
+        except _DaemonConnectError:
             self.start_daemon()
-            chunks = self._send(payload, request_timeout_seconds)
+            try:
+                chunks = self._send(payload, request_timeout_seconds)
+            except OSError as exc:
+                raise DaemonClientError(f"daemon request failed: {exc}") from exc
+        except socket.timeout as exc:
+            raise DaemonClientError(
+                f"daemon did not respond within {request_timeout_seconds}s"
+            ) from exc
+        except OSError as exc:
+            raise DaemonClientError(f"daemon request failed: {exc}") from exc
 
         if not chunks:
             raise DaemonClientError("daemon returned no response")
         response = json.loads(b"".join(chunks).decode("utf-8"))
-        if isinstance(response, dict) and response.get("error"):
-            raise DaemonClientError(str(response["error"]))
         if not isinstance(response, dict):
             raise DaemonClientError("daemon returned non-object response")
+        # Only a daemon-level failure envelope is an error. A successful
+        # snapshot legitimately carries a non-empty "error" field (the agent's
+        # own provider error) and must be returned, not raised.
+        if response.get("error") and (response.get("daemon_error") or set(response) == {"error"}):
+            raise DaemonClientError(str(response["error"]))
         return response
 
     def _send(self, payload: dict[str, Any], request_timeout_seconds: int) -> list[bytes]:
         path = socket_path()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(request_timeout_seconds)
-            client.connect(str(path))
+            try:
+                client.connect(str(path))
+            except OSError as exc:
+                raise _DaemonConnectError(str(exc)) from exc
             client.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
             chunks: list[bytes] = []
             while True:
@@ -91,9 +114,16 @@ class DaemonClient:
                 client.settimeout(0.2)
                 client.connect(str(path))
             return True
-        except OSError:
+        except ConnectionRefusedError:
+            # No listener behind the file: a stale socket from a dead daemon.
+            # Remove it so the next daemon can bind.
             try:
                 path.unlink()
             except OSError:
                 pass
+            return False
+        except OSError:
+            # Transient failure (connect timeout under load, unlink race): the
+            # daemon may well be alive — never delete its socket here, or every
+            # live agent it owns becomes unreachable.
             return False

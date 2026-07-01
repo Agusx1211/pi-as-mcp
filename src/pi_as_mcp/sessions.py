@@ -66,6 +66,10 @@ def _default_inactivity_timeout_seconds() -> float:
 DEFAULT_INACTIVITY_TIMEOUT_SECONDS = _default_inactivity_timeout_seconds()
 # Separate, short bound for the prompt-accept handshake (Pi acks immediately).
 PROMPT_ACK_TIMEOUT_SECONDS = 30
+
+# Statuses from which an agent can never produce another turn. Listeners and
+# prompt-ack waiters stop blocking once the agent reaches one of these.
+TERMINAL_STATUSES = frozenset({"error", "timeout", "stopped", "exited"})
 # How long a worker may sit idle (turn finished, awaiting a possible follow-up)
 # before it is evicted: the Pi subprocess is killed to reclaim memory while the
 # conversation is preserved on disk, so a later reply transparently respawns a
@@ -394,10 +398,13 @@ def usage_to_json(usage: dict[str, Any], *, elapsed_seconds: float) -> dict[str,
     context_used = number_value(data.get("context_used_tokens"))
     context_limit = number_value(data.get("context_limit_tokens"))
     context_percent = number_value(data.get("context_percent"))
+    if context_percent is not None and 0 < context_percent <= 1:
+        # Upstream sometimes reports a 0..1 fraction; normalize to percent.
+        # Applies only to the upstream value: a percent computed below from
+        # exact token counts must not be rescaled when it is genuinely < 1%.
+        context_percent *= 100
     if context_percent is None and context_used is not None and context_limit:
         context_percent = (context_used / context_limit) * 100
-    if context_percent is not None and 0 < context_percent <= 1:
-        context_percent *= 100
 
     data["context_used_tokens"] = int(context_used) if context_used is not None else None
     data["context_limit_tokens"] = int(context_limit) if context_limit is not None else None
@@ -661,7 +668,14 @@ class PiAgentSession:
         self._watchdog_thread = threading.Thread(target=self._watchdog, daemon=True)
         self._watchdog_thread.start()
 
-        self.send(prompt, behavior="auto")
+        try:
+            self.send(prompt, behavior="auto")
+        except BaseException:
+            # The worker and watchdog are already running but this session was
+            # never registered with a manager (registration happens after the
+            # constructor), so nothing else can ever clean it up.
+            self._terminate(mark_status="error")
+            raise
 
     @property
     def _persist_enabled(self) -> bool:
@@ -803,6 +817,11 @@ class PiAgentSession:
         with self._lock:
             if self._turn_count == turn_count_before and self._status not in {"error", "timeout", "stopped"}:
                 self._set_status_locked("running", "Pi accepted prompt")
+        # Let callers (the daemon reply handler) learn the pre-prompt state that
+        # was captured atomically under the session lock, instead of racing a
+        # separate peek against the running turn.
+        response["turn_count_before"] = turn_count_before
+        response["was_running"] = is_running
         return response
 
     def snapshot(self, *, include_events: bool | None = None) -> SessionSnapshot:
@@ -832,12 +851,7 @@ class PiAgentSession:
             try:
                 while True:
                     snapshot = self._snapshot_locked(include_events=include_events)
-                    if snapshot.turn_count > after_turn_count or snapshot.status in {
-                        "error",
-                        "timeout",
-                        "stopped",
-                        "exited",
-                    }:
+                    if snapshot.turn_count > after_turn_count or snapshot.status in TERMINAL_STATUSES:
                         return snapshot, False
 
                     remaining = deadline - time.monotonic()
@@ -855,6 +869,10 @@ class PiAgentSession:
         deadline = time.monotonic() + timeout
         with self._condition:
             while request_id not in self._responses:
+                if self._closed or self._status in TERMINAL_STATUSES:
+                    detail = "; ".join(self._stderr_tail)
+                    message = f"Pi worker terminated before accepting request ({self._status})"
+                    raise PiRpcError(f"{message}: {detail}" if detail else message)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise PiRpcError(f"timed out waiting for Pi to accept request {request_id}")
@@ -873,7 +891,11 @@ class PiAgentSession:
                     break
                 self._handle_stdout_line(line.rstrip("\n").rstrip("\r"))
         finally:
-            self._flush_stream_buffer(turn=self._turn_count + 1)
+            if process is self.process:
+                # Only the currently-attached worker's reader may flush; a stale
+                # reader draining a replaced pipe would race the new reader and
+                # drop or misattribute buffered deltas.
+                self._flush_stream_buffer(turn=self._turn_count + 1)
             with self._condition:
                 # Only the currently-attached worker may declare the agent exited.
                 # An evicted or replaced process draining its pipe must not clobber
@@ -1423,16 +1445,21 @@ class PiAgentSession:
                 os.killpg(process.pid, signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 process.kill()
-            process.wait(timeout=3)
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                # A process stuck in uninterruptible sleep can survive SIGKILL
+                # briefly; letting this raise would kill the watchdog thread.
+                pass
 
-    def _terminate(self, *, mark_status: str) -> None:
+    def _terminate(self, *, mark_status: str, reason: str | None = None) -> None:
         observer_event: tuple[str, SessionSnapshot] | None = None
         with self._condition:
             if self._closed:
                 return
             self._closed = True
             process = self.process
-            self._set_status_locked(mark_status, mark_status)
+            self._set_status_locked(mark_status, reason or mark_status)
             self.current_tool = None
             observer_type = "agent_stopped" if mark_status == "stopped" else "agent_updated"
             observer_event = (observer_type, self._snapshot_locked(include_events=False))
@@ -1464,10 +1491,13 @@ class PiAgentSession:
             pass
 
     def _flush_stream_buffer(self, *, turn: int) -> None:
-        if not self._stream_buffer:
+        # Swap under the lock: during a respawn the old and new stdout readers
+        # briefly overlap, so read-then-clear must be atomic against appends.
+        with self._lock:
+            text = self._stream_buffer
+            self._stream_buffer = ""
+        if not text:
             return
-        text = self._stream_buffer
-        self._stream_buffer = ""
         self._emit_transcript("stream", {"text": text}, turn=turn)
 
     def _persist_transcript_event(self, event_type: Any, event: dict[str, Any], *, turn: int) -> None:
@@ -1479,7 +1509,8 @@ class PiAgentSession:
             # every reasoning trace without writing one line per token.
             text = extract_message_update_text(event)
             if text:
-                self._stream_buffer += text
+                with self._lock:
+                    self._stream_buffer += text
             return
         self._flush_stream_buffer(turn=turn)
         if event_type == "response":
@@ -1509,6 +1540,7 @@ class SessionManager:
     ) -> None:
         self._lock = threading.RLock()
         self._sessions: dict[str, PiAgentSession] = {}
+        self._closed = False
         self._runner = PiRpcRunner()
         self.parent_id = parent_id or uuid.uuid4().hex
         self.owner_pid = owner_pid
@@ -1545,7 +1577,14 @@ class SessionManager:
             idle_eviction_seconds=self._idle_eviction_seconds,
         )
         with self._lock:
-            self._sessions[agent_id] = session
+            closed = self._closed
+            if not closed:
+                self._sessions[agent_id] = session
+        if closed:
+            # The manager was closed (parent died) while the worker was
+            # spawning; an unregistered session would leak its process forever.
+            session._terminate(mark_status="stopped", reason="parent closed during start")
+            raise PiRpcError("parent scope closed while starting agent")
         return session.snapshot()
 
     def reply(
@@ -1555,9 +1594,21 @@ class SessionManager:
         prompt: str,
         behavior: ReplyBehavior,
     ) -> SessionSnapshot:
+        snapshot, _ack = self.reply_with_details(agent_id, prompt=prompt, behavior=behavior)
+        return snapshot
+
+    def reply_with_details(
+        self,
+        agent_id: str,
+        *,
+        prompt: str,
+        behavior: ReplyBehavior,
+    ) -> tuple[SessionSnapshot, dict[str, Any]]:
+        """Reply and also return the prompt ack, which carries the pre-prompt
+        ``turn_count_before``/``was_running`` captured under the session lock."""
         session = self._get(agent_id)
-        session.send(prompt, behavior=behavior)
-        return session.snapshot()
+        ack = session.send(prompt, behavior=behavior)
+        return session.snapshot(), ack
 
     def peek(self, agent_id: str, *, include_events: bool = False) -> SessionSnapshot:
         return self._get(agent_id).snapshot(include_events=include_events)
@@ -1611,12 +1662,20 @@ class SessionManager:
         with self._lock:
             return agent_id in self._sessions
 
+    def is_empty(self) -> bool:
+        with self._lock:
+            return not self._sessions
+
     def close(self, *, reason: str = "parent closed") -> int:
         with self._lock:
+            self._closed = True
             sessions = list(self._sessions.values())
             self._sessions.clear()
         for session in sessions:
-            session._terminate(mark_status=reason)
+            # The status must stay in TERMINAL_STATUSES so blocked listeners
+            # return instead of re-waiting until their full timeout; the
+            # human-readable reason goes to last_action instead.
+            session._terminate(mark_status="stopped", reason=reason)
         return len(sessions)
 
     def _get(self, agent_id: str) -> PiAgentSession:

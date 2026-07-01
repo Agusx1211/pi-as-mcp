@@ -565,11 +565,23 @@ class DaemonState:
             with self._lock:
                 if self._closed:
                     return
-                dead_scope_ids = [
-                    scope_id
-                    for scope_id, identity in self._identities.items()
-                    if identity.owner_pid is not None and not pid_exists(identity.owner_pid)
-                ]
+                dead_scope_ids = []
+                for scope_id, identity in self._identities.items():
+                    if identity.owner_pid is not None:
+                        if not pid_exists(identity.owner_pid):
+                            dead_scope_ids.append(scope_id)
+                        continue
+                    # Scopes without an owner pid (CLI peers, bare hints) keep
+                    # their agents alive after the client exits by design, but
+                    # an *empty* manager whose creating peer is gone is a pure
+                    # leak — it would accumulate forever in a long-lived daemon.
+                    manager = self._managers.get(scope_id)
+                    if (
+                        identity.peer_pid is not None
+                        and not pid_exists(identity.peer_pid)
+                        and (manager is None or manager.is_empty())
+                    ):
+                        dead_scope_ids.append(scope_id)
                 dead_managers = [
                     self._managers.pop(scope_id)
                     for scope_id in dead_scope_ids
@@ -593,7 +605,9 @@ class RequestHandler(socketserver.StreamRequestHandler):
             request = json.loads(line.decode("utf-8"))
             response = self.handle_request(request)
         except Exception as exc:
-            response = {"error": str(exc)}
+            # daemon_error distinguishes this failure envelope from a successful
+            # snapshot that carries the agent's own non-empty "error" field.
+            response = {"error": str(exc), "daemon_error": True}
         self.wfile.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
         self.wfile.flush()
 
@@ -647,12 +661,17 @@ class RequestHandler(socketserver.StreamRequestHandler):
             agent_id = required_str(request, "agent_id")
             match = STATE.manager_identity_for_agent(agent_id)
             target_manager, target_identity = match if match else (manager_for_scope(), identity)
-            snapshot = target_manager.reply(
+            snapshot, ack = target_manager.reply_with_details(
                 agent_id,
                 prompt=required_str(request, "prompt"),
                 behavior=request.get("behavior", "auto"),
             )
             data = snapshot.to_json(verbosity=verbosity)
+            # Pre-prompt state captured atomically under the session lock, so
+            # callers don't need a separate (racy) peek to build a monitor
+            # command for the turn this reply lands in.
+            data["reply_after_turn_count"] = int(ack.get("turn_count_before") or 0)
+            data["reply_was_running"] = bool(ack.get("was_running"))
             STATE.record_agent_snapshot(event_type="agent_updated", snapshot=data, identity=target_identity)
             return data
 
@@ -827,8 +846,20 @@ def serve() -> None:
                 client.settimeout(0.2)
                 client.connect(str(path))
             return
+        except ConnectionRefusedError:
+            # Stale socket from a dead daemon; a concurrent starter may have
+            # already removed it.
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        except FileNotFoundError:
+            pass
         except OSError:
-            path.unlink()
+            # Probe failed some other way (e.g. connect timeout because the
+            # listener is busy). Assume a live daemon rather than stealing its
+            # socket out from under it.
+            return
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     server = UnixServer(str(path), RequestHandler)
     atexit.register(STATE.close)

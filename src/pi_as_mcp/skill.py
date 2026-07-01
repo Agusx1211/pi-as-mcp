@@ -12,6 +12,7 @@ intro prose is operator-customizable.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 
 from pi_as_mcp.config import AppConfig, load_config
@@ -130,7 +131,9 @@ def _safe_catalog(runner: PiRpcRunner | None) -> list[CatalogModel] | None:
     """Best-effort catalog fetch; capabilities are decoration, never required."""
     try:
         return (runner or PiRpcRunner()).list_catalog()
-    except (PiRpcError, OSError):
+    except (PiRpcError, OSError, subprocess.SubprocessError):
+        # SubprocessError covers a hung `pi --list-models` (TimeoutExpired),
+        # which is not an OSError.
         return None
 
 

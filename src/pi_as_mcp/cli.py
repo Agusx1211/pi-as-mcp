@@ -45,6 +45,9 @@ def wait_for_agent(
     after_turn_count: int,
     timeout_seconds: int,
 ) -> dict[str, Any]:
+    if timeout_seconds < 0:
+        raise DaemonClientError("--timeout-seconds must be >= 0")
+
     started = time.monotonic()
     last: dict[str, Any] | None = None
 

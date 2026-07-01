@@ -69,11 +69,22 @@ def test_score_tool_is_config_gated(tmp_path, monkeypatch) -> None:
 def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
     class FakeClient:
         def request(self, command: str, **kwargs):
-            if command in {"delegate", "reply"}:
+            if command == "delegate":
+                return {
+                    "agent_id": "agent-1",
+                    "status": "running",
+                    "turn_count": 0,
+                }
+            if command == "reply":
+                # Mirrors the daemon: the reply response carries the pre-prompt
+                # state captured atomically under the session lock.
+                was_idle = kwargs.get("agent_id") == "idle-agent"
                 return {
                     "agent_id": str(kwargs.get("agent_id") or "agent-1"),
                     "status": "running",
-                    "turn_count": 3 if kwargs.get("agent_id") == "idle-agent" else 0,
+                    "turn_count": 3 if was_idle else 0,
+                    "reply_after_turn_count": 3 if was_idle else 0,
+                    "reply_was_running": not was_idle,
                 }
             if command in {"peek", "stop"}:
                 is_idle_reply_probe = kwargs.get("agent_id") == "idle-agent"
