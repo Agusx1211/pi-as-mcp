@@ -34,9 +34,20 @@ def test_mcp_surface_is_small_and_structured() -> None:
         assert "result" not in tools["delegate"].outputSchema["properties"]
         for name in {"agent_peek", "agent_stop"}:
             schema = tools[name].outputSchema
+            # The response envelope is always present; verbosity-dependent
+            # fields (snapshot detail, response_pending/monitor_command) are
+            # optional so a lean "response"-level peek validates.
+            assert set(schema["required"]) == {
+                "agent_id",
+                "status",
+                "final_text",
+                "turn_count",
+                "error",
+            }
             for field in {"tool_calls", "stderr_tail", "event_tail"}:
                 assert schema["properties"][field]["type"] == "array"
-                assert "default" not in schema["properties"][field]
+            for field in {"response_pending", "monitor_command", "monitor_hint"}:
+                assert field in schema["properties"]
         # The only resource is the MCP-provided "cheap sub-agents" skill.
         resources = await mcp.list_resources()
         assert len(resources) == 1
@@ -88,6 +99,16 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
                 }
             if command in {"peek", "stop"}:
                 is_idle_reply_probe = kwargs.get("agent_id") == "idle-agent"
+                if kwargs.get("verbosity") == "response":
+                    # Mirrors the daemon: "response" verbosity gates final_text
+                    # on turn completion and carries no snapshot detail.
+                    return {
+                        "agent_id": str(kwargs.get("agent_id") or "agent-1"),
+                        "status": "idle" if is_idle_reply_probe else "running",
+                        "turn_count": 3 if is_idle_reply_probe else 0,
+                        "final_text": "all done" if is_idle_reply_probe else "",
+                        "response_pending": not is_idle_reply_probe,
+                    }
                 return {
                     "agent_id": str(kwargs.get("agent_id") or "agent-1"),
                     "status": "idle" if is_idle_reply_probe else "running",
@@ -138,8 +159,27 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
         assert idle_reply["monitor_after_turn_count"] == 3
         assert idle_reply["queued_turn_expected"] is True
 
-        for tool_name in {"agent_peek", "agent_stop"}:
-            _, structured = await mcp.call_tool(tool_name, {"agent_id": "agent-1"})
+        # Default peek verbosity is "response": while the turn is in flight the
+        # answer is withheld and the caller gets an explicit wait instruction.
+        _, pending_peek = await mcp.call_tool("agent_peek", {"agent_id": "agent-1"})
+        assert pending_peek["response_pending"] is True
+        assert pending_peek["final_text"] == ""
+        assert pending_peek["monitor_command"] == "piw agent-1"
+        assert "monitor_hint" in pending_peek
+        assert pending_peek.get("tool_calls") in (None, [])
+
+        _, done_peek = await mcp.call_tool("agent_peek", {"agent_id": "idle-agent"})
+        assert done_peek["response_pending"] is False
+        assert done_peek["final_text"] == "all done"
+        assert done_peek.get("monitor_command") is None
+
+        # "summary" and above keep the full snapshot envelope; agent_stop
+        # still defaults to "summary".
+        _, summary_peek = await mcp.call_tool(
+            "agent_peek", {"agent_id": "agent-1", "verbosity": "summary"}
+        )
+        _, stop = await mcp.call_tool("agent_stop", {"agent_id": "agent-1"})
+        for structured in (summary_peek, stop):
             assert structured["tool_calls"] == []
             assert structured["stderr_tail"] == []
             assert structured["event_tail"] == []

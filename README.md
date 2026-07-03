@@ -127,9 +127,15 @@ Pi's follow-up streaming. `behavior="steer"` sends it as steering instead.
 
 ### `agent_peek`
 
-Return the latest state for an async Pi session: `status`, `final_text`,
-`turn_count`, `tool_call_count`, `event_counts`. Use for manual checks or
-recovery, not as the normal wait loop.
+Return the latest state for an async Pi session without waiting. The default
+`verbosity="response"` hands back `final_text` only once the turn has
+finished; while the agent is still working it returns `response_pending: true`
+and a `monitor_command` to wait on instead (mid-turn `final_text` would be an
+intermediate assistant message, not the answer). Pass `verbosity="summary"`
+for progress metadata (`status`, `tool_call_count`, `event_counts`, plus the
+current `final_text`), `"normal"` to add the tool-call ledger, or `"debug"`
+for raw events. Use for manual checks or recovery, not as the normal wait
+loop.
 
 ### `agent_stop`
 

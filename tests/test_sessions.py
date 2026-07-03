@@ -913,3 +913,65 @@ for line in sys.stdin:
         session._running = False
 
     manager.close()
+
+
+def make_snapshot(status: str, final_text: str, error: str | None = None):
+    from pi_as_mcp.sessions import SessionSnapshot
+
+    return SessionSnapshot(
+        agent_id="agent-1",
+        status=status,
+        created_at=123.0,
+        cwd="/tmp/project",
+        provider="local",
+        model="example-model",
+        tool_mode="read-only",
+        final_text=final_text,
+        turn_count=2,
+        usage={},
+        tool_calls=[],
+        event_counts={"message_end": 4},
+        error=error,
+    )
+
+
+def test_response_verbosity_withholds_in_flight_text() -> None:
+    # final_text mid-turn holds intermediate assistant text; the "response"
+    # level must not hand it over as if it were the finished answer.
+    for status in ("starting", "running"):
+        data = make_snapshot(status, "let me check that file...").to_json(verbosity="response")
+        assert data == {
+            "agent_id": "agent-1",
+            "status": status,
+            "turn_count": 2,
+            "final_text": "",
+            "response_pending": True,
+        }
+
+
+def test_response_verbosity_returns_text_on_turn_boundary() -> None:
+    for status in ("idle", "exited", "stopped", "error", "timeout"):
+        data = make_snapshot(status, "the answer").to_json(verbosity="response")
+        assert data["response_pending"] is False
+        assert data["final_text"] == "the answer"
+        # Lean by design: no snapshot detail at this level.
+        assert "tool_calls" not in data
+        assert "transcript" not in data
+        assert "usage" not in data
+
+
+def test_response_verbosity_keeps_error() -> None:
+    data = make_snapshot("error", "", error="worker crashed").to_json(verbosity="response")
+    assert data["error"] == "worker crashed"
+    assert data["response_pending"] is False
+
+
+def test_validate_response_verbosity_accepts_response() -> None:
+    import pytest
+
+    from pi_as_mcp.pi_rpc import PiRpcError
+    from pi_as_mcp.sessions import validate_response_verbosity
+
+    assert validate_response_verbosity("response") == "response"
+    with pytest.raises(PiRpcError):
+        validate_response_verbosity("everything")

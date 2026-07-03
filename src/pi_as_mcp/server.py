@@ -74,21 +74,34 @@ class ToolCallResult(TypedDict):
 class SessionSnapshotBase(TypedDict):
     agent_id: str
     status: str
+    final_text: str
+    turn_count: int
+    error: str
+
+
+# total=False rather than NotRequired: under `from __future__ import
+# annotations` NotRequired is stringized and invisible to __required_keys__,
+# which FastMCP reads to build the output schema.
+class SessionSnapshotOptional(TypedDict, total=False):
+    # "response" verbosity only: whether a turn is still in flight. When true,
+    # final_text is withheld and monitor_command tells the caller how to wait.
+    response_pending: bool
+    monitor_command: str
+    monitor_hint: str
+    # "summary" verbosity and above.
     cwd: str
     provider: str
     model: str
     tool_mode: str
-    final_text: str
-    turn_count: int
     event_counts: dict[str, int]
     tool_call_count: int
-
-
-class SessionSnapshotResult(SessionSnapshotBase):
     tool_calls: list[ToolCallResult]
     stderr_tail: list[str]
     event_tail: list[dict[str, Any]]
-    error: str
+
+
+class SessionSnapshotResult(SessionSnapshotBase, SessionSnapshotOptional):
+    pass
 
 
 def ensure_wait_shim() -> str:
@@ -134,25 +147,45 @@ def monitor_result(
 
 
 def snapshot_result(data: dict[str, Any]) -> SessionSnapshotResult:
+    result: SessionSnapshotResult = {
+        "agent_id": str(data["agent_id"]),
+        "status": str(data["status"]),
+        "final_text": str(data.get("final_text") or ""),
+        "turn_count": int(data.get("turn_count", 0)),
+        "error": str(data.get("error") or ""),
+    }
+    if "response_pending" in data:
+        # "response" verbosity: the daemon already gated final_text on turn
+        # completion; while pending, hand back the wait command so the caller
+        # blocks on the turn instead of poll-peeking.
+        pending = bool(data["response_pending"])
+        result["response_pending"] = pending
+        if pending:
+            result["monitor_command"] = wait_command(
+                result["agent_id"], after_turn_count=result["turn_count"]
+            )
+            result["monitor_hint"] = (
+                "agent is still working; run monitor_command in a background shell "
+                "to wait for the turn to finish, then peek again"
+            )
+        return result
     tool_calls = data.get("tool_calls")
     stderr_tail = data.get("stderr_tail")
     event_tail = data.get("event_tail")
-    return {
-        "agent_id": str(data["agent_id"]),
-        "status": str(data["status"]),
-        "cwd": str(data["cwd"]),
-        "provider": str(data["provider"]),
-        "model": str(data["model"]),
-        "tool_mode": str(data["tool_mode"]),
-        "final_text": str(data.get("final_text") or ""),
-        "turn_count": int(data.get("turn_count", 0)),
-        "event_counts": cast(dict[str, int], data.get("event_counts") or {}),
-        "tool_call_count": int(data.get("tool_call_count", 0)),
-        "tool_calls": cast(list[ToolCallResult], tool_calls if isinstance(tool_calls, list) else []),
-        "stderr_tail": cast(list[str], stderr_tail if isinstance(stderr_tail, list) else []),
-        "event_tail": cast(list[dict[str, Any]], event_tail if isinstance(event_tail, list) else []),
-        "error": str(data.get("error") or ""),
-    }
+    result["cwd"] = str(data["cwd"])
+    result["provider"] = str(data["provider"])
+    result["model"] = str(data["model"])
+    result["tool_mode"] = str(data["tool_mode"])
+    result["event_counts"] = cast(dict[str, int], data.get("event_counts") or {})
+    result["tool_call_count"] = int(data.get("tool_call_count", 0))
+    result["tool_calls"] = cast(
+        list[ToolCallResult], tool_calls if isinstance(tool_calls, list) else []
+    )
+    result["stderr_tail"] = cast(list[str], stderr_tail if isinstance(stderr_tail, list) else [])
+    result["event_tail"] = cast(
+        list[dict[str, Any]], event_tail if isinstance(event_tail, list) else []
+    )
+    return result
 
 
 _score_tool_registered = False
@@ -276,8 +309,14 @@ def agent_reply(
 
 
 @mcp.tool()
-def agent_peek(agent_id: str, verbosity: ResponseVerbosity = "summary") -> SessionSnapshotResult:
-    """Peek at a Pi subagent without waiting."""
+def agent_peek(agent_id: str, verbosity: ResponseVerbosity = "response") -> SessionSnapshotResult:
+    """Peek at a Pi subagent without waiting.
+
+    The default "response" verbosity returns the agent's answer (final_text)
+    only once its turn has finished; while it is still working you get
+    response_pending=true and a monitor_command to wait on instead. Use
+    "summary" for progress metadata, "normal" to add the tool-call ledger,
+    or "debug" for raw events."""
 
     return snapshot_result(
         client.request(

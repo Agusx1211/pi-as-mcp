@@ -64,7 +64,10 @@ Example call:
 
 Then run its `monitor_command` (e.g. `piw <agent_id>`) in the background and
 keep working. Use `agent_reply` to send a follow-up, `agent_peek` to check
-state without waiting, and `agent_stop` to abort.
+state without waiting, and `agent_stop` to abort. By default `agent_peek`
+returns the agent's answer only once its turn has finished; while it is still
+working you get `response_pending: true` plus a `monitor_command` to wait on
+(pass `verbosity: "summary"` or `"normal"` for progress detail instead).
 
 Read `{SKILL_RESOURCE_URI}` (or call the `models` tool) for the current
 roster at any time."""

@@ -18,7 +18,7 @@ def add_common_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd")
     parser.add_argument("--model")
     parser.add_argument("--tool-mode", default="read-only", choices=["none", "read-only", "write", "full"])
-    parser.add_argument("--verbosity", default="summary", choices=["summary", "normal", "debug"])
+    parser.add_argument("--verbosity", default="summary", choices=["response", "summary", "normal", "debug"])
 
 
 def compact_wait_response(data: dict[str, Any]) -> dict[str, Any]:
@@ -93,17 +93,17 @@ def parser() -> argparse.ArgumentParser:
     reply.add_argument("agent_id")
     reply.add_argument("prompt")
     reply.add_argument("--behavior", default="auto", choices=["auto", "follow-up", "steer"])
-    reply.add_argument("--verbosity", default="summary", choices=["summary", "normal", "debug"])
+    reply.add_argument("--verbosity", default="summary", choices=["response", "summary", "normal", "debug"])
 
     peek = sub.add_parser("peek", help="show one agent snapshot")
     peek.add_argument("agent_id")
-    peek.add_argument("--verbosity", default="summary", choices=["summary", "normal", "debug"])
+    peek.add_argument("--verbosity", default="summary", choices=["response", "summary", "normal", "debug"])
 
     listen = sub.add_parser("listen", help="wait until an agent completes another turn")
     listen.add_argument("agent_id")
     listen.add_argument("--after-turn", "--after-turn-count", dest="after_turn_count", type=int, default=0)
     listen.add_argument("--timeout-seconds", type=int, default=60)
-    listen.add_argument("--verbosity", default="summary", choices=["summary", "normal", "debug"])
+    listen.add_argument("--verbosity", default="summary", choices=["response", "summary", "normal", "debug"])
 
     wait = sub.add_parser("wait", aliases=["w"], help="wait quietly until an agent completes a turn")
     wait.add_argument("agent_id")
@@ -118,7 +118,7 @@ def parser() -> argparse.ArgumentParser:
 
     stop = sub.add_parser("stop", help="stop an agent")
     stop.add_argument("agent_id")
-    stop.add_argument("--verbosity", default="summary", choices=["summary", "normal", "debug"])
+    stop.add_argument("--verbosity", default="summary", choices=["response", "summary", "normal", "debug"])
 
     summary = sub.add_parser("summary", help="summarize all live agents")
     summary.add_argument("--scoped", action="store_true", help="show only agents in this CLI parent scope")

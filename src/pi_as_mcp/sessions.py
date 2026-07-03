@@ -34,7 +34,7 @@ from pi_as_mcp.pi_rpc import (
 )
 
 ReplyBehavior = Literal["auto", "follow-up", "steer"]
-ResponseVerbosity = Literal["summary", "normal", "debug"]
+ResponseVerbosity = Literal["response", "summary", "normal", "debug"]
 # Only agents that are spinning up or actively running a turn consume a
 # concurrency slot. An "idle" agent is a live Pi worker that finished its turn
 # and is just waiting for a possible follow-up reply; it does not block new
@@ -110,8 +110,8 @@ def describe_tool_call(tool_name: str, args: dict[str, Any]) -> str:
 
 
 def validate_response_verbosity(verbosity: str) -> ResponseVerbosity:
-    if verbosity not in {"summary", "normal", "debug"}:
-        raise PiRpcError("verbosity must be one of: summary, normal, debug")
+    if verbosity not in {"response", "summary", "normal", "debug"}:
+        raise PiRpcError("verbosity must be one of: response, summary, normal, debug")
     return verbosity  # type: ignore[return-value]
 
 
@@ -440,6 +440,23 @@ class SessionSnapshot:
 
     def to_json(self, *, verbosity: ResponseVerbosity = "normal") -> dict[str, Any]:
         validate_response_verbosity(verbosity)
+        if verbosity == "response":
+            # final_text is overwritten on every message_end, so mid-turn it
+            # holds intermediate assistant text ("let me check that file...")
+            # that a parent would mistake for the answer. This level only hands
+            # the message over once the turn is complete; response_pending is
+            # explicit so callers wait (piw) instead of poll-peeking on "".
+            response_pending = self.status in CONCURRENCY_COUNTED_STATUSES
+            data = {
+                "agent_id": self.agent_id,
+                "status": self.status,
+                "turn_count": self.turn_count,
+                "final_text": "" if response_pending else self.final_text,
+                "response_pending": response_pending,
+            }
+            if self.error:
+                data["error"] = self.error
+            return data
         data: dict[str, Any] = {
             "agent_id": self.agent_id,
             "status": self.status,
