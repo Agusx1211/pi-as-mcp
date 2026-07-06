@@ -344,7 +344,19 @@ def resolve_model(model: str | None = None, provider: str | None = None) -> Mode
 
 
 def resolve_cwd(cwd: str | None) -> Path:
-    path = Path(cwd).expanduser() if cwd else Path.cwd()
+    if cwd:
+        path = Path(cwd).expanduser()
+    else:
+        try:
+            path = Path.cwd()
+        except OSError as exc:
+            # The daemon's own working directory was deleted out from under it
+            # (e.g. it was spawned from an ephemeral dir). Fail loudly instead
+            # of letting the spawned worker die at startup with ENOENT/uv_cwd.
+            raise PiRpcError(
+                "no cwd was given and the daemon's working directory no longer "
+                "exists; pass an explicit cwd (or restart the daemon)"
+            ) from exc
     path = path.resolve()
     if not path.exists():
         raise PiRpcError(f"cwd does not exist: {path}")

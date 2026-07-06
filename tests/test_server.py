@@ -3,9 +3,17 @@ from __future__ import annotations
 import json
 
 import anyio
+import jsonschema
 
 from pi_as_mcp import server, skill
 from pi_as_mcp.server import mcp
+
+
+def schema_allows_type(schema: dict, expected: str) -> bool:
+    return schema.get("type") == expected or any(
+        isinstance(option, dict) and option.get("type") == expected
+        for option in schema.get("anyOf", [])
+    )
 
 
 def test_mcp_surface_is_small_and_structured() -> None:
@@ -45,9 +53,26 @@ def test_mcp_surface_is_small_and_structured() -> None:
                 "error",
             }
             for field in {"tool_calls", "stderr_tail", "event_tail"}:
-                assert schema["properties"][field]["type"] == "array"
-            for field in {"response_pending", "monitor_command", "monitor_hint"}:
-                assert field in schema["properties"]
+                field_schema = schema["properties"][field]
+                assert schema_allows_type(field_schema, "array")
+                assert schema_allows_type(field_schema, "null")
+            for field, expected_type in {
+                "response_pending": "boolean",
+                "monitor_command": "string",
+                "monitor_hint": "string",
+                "cwd": "string",
+                "provider": "string",
+                "model": "string",
+                "tool_mode": "string",
+                "event_counts": "object",
+                "tool_call_count": "integer",
+            }.items():
+                field_schema = schema["properties"][field]
+                assert schema_allows_type(field_schema, expected_type)
+                assert schema_allows_type(field_schema, "null")
+        model_alias_schema = tools["models"].outputSchema["$defs"]["ModelAlias"]
+        assert schema_allows_type(model_alias_schema["properties"]["description"], "string")
+        assert schema_allows_type(model_alias_schema["properties"]["description"], "null")
         # The only resource is the MCP-provided "cheap sub-agents" skill.
         resources = await mcp.list_resources()
         assert len(resources) == 1
@@ -134,6 +159,8 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
             raise AssertionError(command)
 
     async def check() -> None:
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+
         monkeypatch.setattr(server, "client", FakeClient())
         monkeypatch.setattr(
             server,
@@ -144,17 +171,20 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
         )
 
         _, delegate = await mcp.call_tool("delegate", {"prompt": "one"})
+        jsonschema.validate(delegate, tools["delegate"].outputSchema)
         assert delegate["monitor_command"] == "piw agent-1"
         assert delegate["monitor_after_turn_count"] == 0
         assert delegate["queued_turn_expected"] is True
 
         _, reply = await mcp.call_tool("agent_reply", {"agent_id": "agent-1", "prompt": "two"})
+        jsonschema.validate(reply, tools["agent_reply"].outputSchema)
         assert reply["monitor_command"] == "piw agent-1"
         assert reply["monitor_after_turn_count"] == 0
         assert reply["queued_turn_expected"] is False
         assert "running turn" in reply["monitor_hint"]
 
         _, idle_reply = await mcp.call_tool("agent_reply", {"agent_id": "idle-agent", "prompt": "two"})
+        jsonschema.validate(idle_reply, tools["agent_reply"].outputSchema)
         assert idle_reply["monitor_command"] == "piw idle-agent -a 3"
         assert idle_reply["monitor_after_turn_count"] == 3
         assert idle_reply["queued_turn_expected"] is True
@@ -162,6 +192,7 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
         # Default peek verbosity is "response": while the turn is in flight the
         # answer is withheld and the caller gets an explicit wait instruction.
         _, pending_peek = await mcp.call_tool("agent_peek", {"agent_id": "agent-1"})
+        jsonschema.validate(pending_peek, tools["agent_peek"].outputSchema)
         assert pending_peek["response_pending"] is True
         assert pending_peek["final_text"] == ""
         assert pending_peek["monitor_command"] == "piw agent-1"
@@ -169,6 +200,7 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
         assert pending_peek.get("tool_calls") in (None, [])
 
         _, done_peek = await mcp.call_tool("agent_peek", {"agent_id": "idle-agent"})
+        jsonschema.validate(done_peek, tools["agent_peek"].outputSchema)
         assert done_peek["response_pending"] is False
         assert done_peek["final_text"] == "all done"
         assert done_peek.get("monitor_command") is None
@@ -179,6 +211,8 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
             "agent_peek", {"agent_id": "agent-1", "verbosity": "summary"}
         )
         _, stop = await mcp.call_tool("agent_stop", {"agent_id": "agent-1"})
+        jsonschema.validate(summary_peek, tools["agent_peek"].outputSchema)
+        jsonschema.validate(stop, tools["agent_stop"].outputSchema)
         for structured in (summary_peek, stop):
             assert structured["tool_calls"] == []
             assert structured["stderr_tail"] == []
@@ -186,6 +220,7 @@ def test_structured_tools_return_schema_safe_content(monkeypatch) -> None:
             assert structured["error"] == ""
 
         _, models = await mcp.call_tool("models", {})
+        jsonschema.validate(models, tools["models"].outputSchema)
         assert models["models"][0]["provider"] == "local"
 
     anyio.run(check)

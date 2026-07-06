@@ -923,6 +923,17 @@ class PiAgentSession:
                     and not self._evicted
                     and self._status not in {"error", "timeout", "stopped"}
                 ):
+                    if self._status in {"starting", "running"}:
+                        # The worker died mid-turn: final_text still holds a
+                        # previous turn's answer (it is only overwritten when a
+                        # new assistant message arrives), so returning it would
+                        # hand callers a stale echo instead of a failure. Clear
+                        # it and surface an explicit error.
+                        self._final_text = ""
+                        if self._error is None:
+                            self._record_provider_error_locked(
+                                "Pi worker exited mid-turn without producing a response"
+                            )
                     self._set_status_locked("exited", "Pi worker exited")
                     observer_event = ("agent_updated", self._snapshot_locked(include_events=False))
                     terminal_status = "exited"

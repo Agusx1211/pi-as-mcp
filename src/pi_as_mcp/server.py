@@ -47,7 +47,7 @@ class ModelAlias(TypedDict):
     alias: str
     provider: str
     model: str
-    description: NotRequired[str]
+    description: NotRequired[str | None]
 
 
 class ModelsResult(TypedDict):
@@ -85,19 +85,19 @@ class SessionSnapshotBase(TypedDict):
 class SessionSnapshotOptional(TypedDict, total=False):
     # "response" verbosity only: whether a turn is still in flight. When true,
     # final_text is withheld and monitor_command tells the caller how to wait.
-    response_pending: bool
-    monitor_command: str
-    monitor_hint: str
+    response_pending: bool | None
+    monitor_command: str | None
+    monitor_hint: str | None
     # "summary" verbosity and above.
-    cwd: str
-    provider: str
-    model: str
-    tool_mode: str
-    event_counts: dict[str, int]
-    tool_call_count: int
-    tool_calls: list[ToolCallResult]
-    stderr_tail: list[str]
-    event_tail: list[dict[str, Any]]
+    cwd: str | None
+    provider: str | None
+    model: str | None
+    tool_mode: str | None
+    event_counts: dict[str, int] | None
+    tool_call_count: int | None
+    tool_calls: list[ToolCallResult] | None
+    stderr_tail: list[str] | None
+    event_tail: list[dict[str, Any]] | None
 
 
 class SessionSnapshotResult(SessionSnapshotBase, SessionSnapshotOptional):

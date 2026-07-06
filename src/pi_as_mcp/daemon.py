@@ -839,6 +839,16 @@ class UnixServer(socketserver.ThreadingUnixStreamServer):
 
 
 def serve() -> None:
+    # The daemon inherits the cwd of whichever client auto-spawned it, which
+    # can be an ephemeral directory (seen live: a date-keyed
+    # ~/.miproxy/captures/YYYY/MM/DD dir deleted by a nightly archive cron).
+    # After that deletion, every subprocess spawned without an explicit cwd —
+    # `pi --list-models` sits on the critical path of every delegate — dies at
+    # node bootstrap with ENOENT/uv_cwd. Re-anchor to a stable directory now.
+    try:
+        os.chdir(Path.home())
+    except OSError:
+        os.chdir("/")
     path = socket_path()
     if path.exists():
         try:

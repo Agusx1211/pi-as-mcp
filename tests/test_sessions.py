@@ -975,3 +975,74 @@ def test_validate_response_verbosity_accepts_response() -> None:
     assert validate_response_verbosity("response") == "response"
     with pytest.raises(PiRpcError):
         validate_response_verbosity("everything")
+
+
+def test_worker_death_mid_turn_clears_stale_final_text(tmp_path: Path) -> None:
+    # A worker that dies mid-turn must not leave the previous turn's answer in
+    # final_text: callers polling/waiting would read it as the (stale) response
+    # to the prompt that actually failed. Death mid-turn clears final_text and
+    # surfaces an explicit error instead.
+    fake_pi = write_fake_pi(
+        tmp_path,
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("fake-pi 1.0")
+    raise SystemExit(0)
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+first = True
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("type") == "abort":
+        break
+    print(json.dumps({"id": request["id"], "type": "response", "command": "prompt", "success": True}), flush=True)
+    print(json.dumps({"type": "agent_start"}), flush=True)
+    if not first:
+        # Simulate the worker dying mid-turn (context overflow, OOM, crash):
+        # no message_end / agent_end for this prompt.
+        raise SystemExit(1)
+    first = False
+    message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "first answer"}],
+        "usage": {"input": 10, "output": 5, "totalTokens": 15},
+    }
+    print(json.dumps({"type": "message_end", "message": message}), flush=True)
+    print(json.dumps({"type": "agent_end", "messages": [message]}), flush=True)
+""",
+    )
+
+    manager = SessionManager()
+    manager._runner.pi_bin = str(fake_pi)
+
+    started = manager.start(
+        prompt="one",
+        cwd=str(tmp_path),
+        model="local/example-model",
+        provider=None,
+        tool_mode="none",
+        include_events=False,
+    )
+    first_done, timed_out = manager.listen(started.agent_id, after_turn_count=0, timeout_seconds=5)
+    assert timed_out is False
+    assert first_done.final_text == "first answer"
+
+    manager.reply(started.agent_id, prompt="two", behavior="auto")
+    second, timed_out = manager.listen(started.agent_id, after_turn_count=1, timeout_seconds=5)
+    assert timed_out is False
+    assert second.status == "exited"
+    assert second.final_text == ""
+    assert second.error is not None and "mid-turn" in second.error
+
+    data = second.to_json(verbosity="response")
+    assert data["final_text"] == ""
+    assert data["response_pending"] is False
+    assert "error" in data
+
+    manager.close()
