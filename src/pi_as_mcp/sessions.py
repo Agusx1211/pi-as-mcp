@@ -51,7 +51,10 @@ CONCURRENCY_COUNTED_STATUSES = {"starting", "running"}
 # can spend many minutes there, so this is generous (60 min) to avoid killing a
 # healthy worker mid-prefill — which the model server logs as "Client
 # disconnected. Stopping generation". Override via PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS.
-def _default_inactivity_timeout_seconds() -> float:
+DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 60 * 60
+
+
+def _inactivity_timeout_seconds() -> float:
     raw = os.environ.get("PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS")
     if raw:
         try:
@@ -60,10 +63,9 @@ def _default_inactivity_timeout_seconds() -> float:
                 return value
         except ValueError:
             pass
-    return 3600.0
+    return DEFAULT_INACTIVITY_TIMEOUT_SECONDS
 
 
-DEFAULT_INACTIVITY_TIMEOUT_SECONDS = _default_inactivity_timeout_seconds()
 # Separate, short bound for the prompt-accept handshake (Pi acks immediately).
 PROMPT_ACK_TIMEOUT_SECONDS = 30
 
@@ -636,7 +638,7 @@ class PiAgentSession:
         self._unsafe_read_only = unsafe_read_only and tool_mode == "read-only"
         self._guard: str | None = READ_ONLY_GUARD if self._unsafe_read_only else None
         self.include_events = include_events
-        self.inactivity_timeout_seconds = DEFAULT_INACTIVITY_TIMEOUT_SECONDS
+        self.inactivity_timeout_seconds = _inactivity_timeout_seconds()
         self.created_at = time.time()
         self.created_monotonic = time.monotonic()
         self.state_since_monotonic = self.created_monotonic

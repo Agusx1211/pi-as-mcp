@@ -7,7 +7,25 @@ import threading
 import time
 from pathlib import Path
 
-from pi_as_mcp.sessions import SessionManager, extract_message_update_parts
+from pi_as_mcp.sessions import (
+    DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
+    SessionManager,
+    _inactivity_timeout_seconds,
+    extract_message_update_parts,
+)
+
+
+def test_inactivity_timeout_default_and_environment_override(monkeypatch) -> None:
+    monkeypatch.delenv("PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS", raising=False)
+    assert DEFAULT_INACTIVITY_TIMEOUT_SECONDS == 60 * 60
+    assert _inactivity_timeout_seconds() == DEFAULT_INACTIVITY_TIMEOUT_SECONDS
+
+    monkeypatch.setenv("PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS", "45.5")
+    assert _inactivity_timeout_seconds() == 45.5
+
+    for invalid_value in ("0", "-1", "not-a-number"):
+        monkeypatch.setenv("PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS", invalid_value)
+        assert _inactivity_timeout_seconds() == DEFAULT_INACTIVITY_TIMEOUT_SECONDS
 
 
 def test_extract_message_update_parts_assistant_message_event_envelope() -> None:
