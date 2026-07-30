@@ -15,7 +15,6 @@ from typing import Any
 
 from pi_as_mcp.compat import (
     CHECKED_REQUEST_COMMAND,
-    COMPAT_COMMAND,
     DAEMON_BUILD_ID,
     DAEMON_PROTOCOL_VERSION,
     compatibility_identity,
@@ -57,7 +56,6 @@ class DaemonClient:
         self.default_parent_hint = default_parent_hint
         self.parent_owner_pid = parent_owner_pid
         self.default_scope_mode = default_scope_mode
-        self._compatible_socket: tuple[int, int] | None = None
 
     def request(self, command: str, *, request_timeout_seconds: int = 30, **params: Any) -> dict[str, Any]:
         payload = {"command": command, **params}
@@ -69,7 +67,6 @@ class DaemonClient:
         if self.parent_owner_pid is not None:
             payload["parent_owner_pid"] = self.parent_owner_pid
 
-        self._ensure_compatible(request_timeout_seconds)
         checked_payload = {
             "command": CHECKED_REQUEST_COMMAND,
             **compatibility_identity(),
@@ -78,16 +75,15 @@ class DaemonClient:
 
         # Happy path: try the real connection directly instead of probing with a
         # throwaway socket first. Only spawn+wait for the daemon when the connect
-        # itself fails (request never delivered), then re-check the replacement
-        # daemon and retry connect with bounded backoff. A failure after connect
-        # is NOT retried: commands like delegate/reply are not idempotent and may
-        # already be executing.
+        # itself fails (request never delivered), then retry connect with bounded
+        # backoff. Every operation is checked atomically by the daemon, so a
+        # separate compatibility probe cannot make this safer. A failure after
+        # connect is NOT retried: commands like delegate/reply are not idempotent
+        # and may already be executing.
         try:
             chunks = self._send(checked_payload, request_timeout_seconds)
         except _DaemonConnectError:
-            self._compatible_socket = None
             self.start_daemon()
-            self._ensure_compatible(request_timeout_seconds)
             try:
                 chunks = self._send_with_connect_retries(
                     checked_payload,
@@ -111,7 +107,7 @@ class DaemonClient:
         response = self._decode_response(chunks)
         if response.get("compatibility_error"):
             raise DaemonClientError(self._compatibility_error(response))
-        if self._is_legacy_unknown_command(response, CHECKED_REQUEST_COMMAND):
+        if self._is_legacy_response(response):
             raise DaemonClientError(self._legacy_error())
         # Only a daemon-level failure envelope is an error. A successful
         # snapshot legitimately carries a non-empty "error" field (the agent's
@@ -119,67 +115,6 @@ class DaemonClient:
         if response.get("error") and (response.get("daemon_error") or set(response) == {"error"}):
             raise DaemonClientError(str(response["error"]))
         return response
-
-    def _ensure_compatible(self, request_timeout_seconds: int) -> None:
-        socket_identity = self._socket_identity()
-        if socket_identity is not None and socket_identity == self._compatible_socket:
-            return
-
-        self._compatible_socket = None
-        for _attempt in range(2):
-            before = self._socket_identity()
-            try:
-                chunks = self._send({"command": COMPAT_COMMAND}, request_timeout_seconds)
-            except _DaemonConnectError:
-                self.start_daemon()
-                try:
-                    chunks = self._send_with_connect_retries(
-                        {"command": COMPAT_COMMAND},
-                        request_timeout_seconds,
-                    )
-                except _DaemonConnectError as exc:
-                    raise DaemonClientError(
-                        f"daemon compatibility check failed: {exc}"
-                    ) from exc
-                except socket.timeout as exc:
-                    raise DaemonClientError(
-                        "daemon compatibility check timed out after "
-                        f"{request_timeout_seconds}s"
-                    ) from exc
-                except OSError as exc:
-                    raise DaemonClientError(
-                        f"daemon compatibility check failed: {exc}"
-                    ) from exc
-            except socket.timeout as exc:
-                raise DaemonClientError(
-                    f"daemon compatibility check timed out after {request_timeout_seconds}s"
-                ) from exc
-            except OSError as exc:
-                raise DaemonClientError(f"daemon compatibility check failed: {exc}") from exc
-
-            response = self._decode_response(chunks)
-            if self._is_legacy_unknown_command(response, COMPAT_COMMAND):
-                raise DaemonClientError(self._legacy_error())
-            if response.get("daemon_error"):
-                raise DaemonClientError(
-                    f"daemon compatibility check failed: {response.get('error') or 'unknown error'}"
-                )
-            if (
-                response.get("protocol_version") != DAEMON_PROTOCOL_VERSION
-                or response.get("build_id") != DAEMON_BUILD_ID
-            ):
-                raise DaemonClientError(self._compatibility_error(response))
-
-            after = self._socket_identity()
-            if after is None or (before is not None and before != after):
-                # The socket changed during the probe. Do not cache a result for
-                # a daemon that may no longer own the pathname.
-                continue
-            self._compatible_socket = after
-            return
-        raise DaemonClientError(
-            "daemon socket was replaced during compatibility checks; no request was executed"
-        )
 
     @staticmethod
     def _decode_response(chunks: list[bytes]) -> dict[str, Any]:
@@ -194,20 +129,11 @@ class DaemonClient:
         return response
 
     @staticmethod
-    def _is_legacy_unknown_command(response: dict[str, Any], command: str) -> bool:
+    def _is_legacy_response(response: dict[str, Any]) -> bool:
         error = str(response.get("error") or "")
         return bool(response.get("daemon_error") or set(response) == {"error"}) and (
-            "unknown command" in error and command in error
+            "unknown command" in error and CHECKED_REQUEST_COMMAND in error
         )
-
-    @staticmethod
-    def _socket_identity(path: Path | None = None) -> tuple[int, int] | None:
-        target = path or socket_path()
-        try:
-            stat = target.stat()
-        except OSError:
-            return None
-        return stat.st_dev, stat.st_ino
 
     @staticmethod
     def _refresh_hint() -> str:

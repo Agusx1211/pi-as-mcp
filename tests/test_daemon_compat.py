@@ -22,15 +22,12 @@ def encoded(response: dict[str, object]) -> list[bytes]:
     return [json.dumps(response).encode("utf-8")]
 
 
-def test_matching_daemon_is_probed_once_per_socket(monkeypatch) -> None:
+def test_every_request_uses_checked_envelope(monkeypatch) -> None:
     client = DaemonClient()
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(client, "_socket_identity", lambda: (7, 11))
 
     def send(payload: dict[str, object], _timeout: int) -> list[bytes]:
         sent.append(payload)
-        if payload["command"] == COMPAT_COMMAND:
-            return encoded({"compatible": True, **compatibility_identity()})
         return encoded({"ok": True})
 
     monkeypatch.setattr(client, "_send", send)
@@ -38,12 +35,22 @@ def test_matching_daemon_is_probed_once_per_socket(monkeypatch) -> None:
     assert client.request("summary") == {"ok": True}
     assert client.request("models") == {"ok": True}
     assert [payload["command"] for payload in sent] == [
-        COMPAT_COMMAND,
         CHECKED_REQUEST_COMMAND,
         CHECKED_REQUEST_COMMAND,
     ]
-    assert sent[1]["request"] == {"command": "summary"}
-    assert sent[2]["request"] == {"command": "models"}
+    assert sent[0]["request"] == {"command": "summary"}
+    assert sent[1]["request"] == {"command": "models"}
+
+
+def test_compat_probe_remains_available_to_older_clients() -> None:
+    response = RequestHandler.handle_request(
+        Mock(),
+        {"command": COMPAT_COMMAND},
+    )
+
+    assert response["compatible"] is True
+    assert response["protocol_version"] == DAEMON_PROTOCOL_VERSION
+    assert response["build_id"] == DAEMON_BUILD_ID
 
 
 def test_matching_checked_envelope_dispatches_nested_request() -> None:
@@ -122,13 +129,14 @@ def test_raw_tui_summary_remains_available_for_legacy_drain(monkeypatch) -> None
 def test_mismatched_daemon_blocks_nested_request(monkeypatch) -> None:
     client = DaemonClient()
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(client, "_socket_identity", lambda: (7, 11))
 
     def send(payload: dict[str, object], _timeout: int) -> list[bytes]:
         sent.append(payload)
         return encoded(
             {
-                "compatible": True,
+                "compatible": False,
+                "compatibility_error": True,
+                "daemon_error": True,
                 "protocol_version": DAEMON_PROTOCOL_VERSION,
                 "build_id": "older-build",
                 "package_version": "0.0.9",
@@ -142,19 +150,22 @@ def test_mismatched_daemon_blocks_nested_request(monkeypatch) -> None:
 
     assert "Existing agents were left untouched" in str(exc.value)
     assert "refresh-daemon.sh" in str(exc.value)
-    assert [payload["command"] for payload in sent] == [COMPAT_COMMAND]
+    assert [payload["command"] for payload in sent] == [CHECKED_REQUEST_COMMAND]
+    assert sent[0]["request"] == {
+        "command": "delegate",
+        "prompt": "must not run",
+    }
 
 
 def test_legacy_daemon_blocks_request_with_refresh_hint(monkeypatch) -> None:
     client = DaemonClient()
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(client, "_socket_identity", lambda: (7, 11))
 
     def send(payload: dict[str, object], _timeout: int) -> list[bytes]:
         sent.append(payload)
         return encoded(
             {
-                "error": f"unknown command: {COMPAT_COMMAND}",
+                "error": f"unknown command: {CHECKED_REQUEST_COMMAND}",
                 "daemon_error": True,
             }
         )
@@ -166,39 +177,7 @@ def test_legacy_daemon_blocks_request_with_refresh_hint(monkeypatch) -> None:
 
     assert "no request was executed" in str(exc.value)
     assert "refresh-daemon.sh" in str(exc.value)
-    assert [payload["command"] for payload in sent] == [COMPAT_COMMAND]
-
-
-def test_socket_replacement_invalidates_compatibility_cache(monkeypatch) -> None:
-    client = DaemonClient()
-    socket_identity = [7, 11]
-    sent: list[tuple[int, str]] = []
-    monkeypatch.setattr(
-        client,
-        "_socket_identity",
-        lambda: (socket_identity[0], socket_identity[1]),
-    )
-
-    def send(payload: dict[str, object], _timeout: int) -> list[bytes]:
-        sent.append((socket_identity[1], str(payload["command"])))
-        if payload["command"] == COMPAT_COMMAND:
-            return encoded({"compatible": True, **compatibility_identity()})
-        return encoded({"ok": True})
-
-    monkeypatch.setattr(client, "_send", send)
-
-    client.request("summary")
-    client.request("summary")
-    socket_identity[1] = 12
-    client.request("summary")
-
-    assert sent == [
-        (11, COMPAT_COMMAND),
-        (11, CHECKED_REQUEST_COMMAND),
-        (11, CHECKED_REQUEST_COMMAND),
-        (12, COMPAT_COMMAND),
-        (12, CHECKED_REQUEST_COMMAND),
-    ]
+    assert [payload["command"] for payload in sent] == [CHECKED_REQUEST_COMMAND]
 
 
 def test_checked_envelope_rejects_mismatch_without_dispatch(monkeypatch) -> None:
@@ -224,13 +203,9 @@ def test_checked_envelope_rejects_mismatch_without_dispatch(monkeypatch) -> None
     start.assert_not_called()
 
 
-def test_checked_envelope_catches_legacy_replacement_after_cached_probe(
-    monkeypatch,
-) -> None:
+def test_checked_envelope_catches_legacy_daemon(monkeypatch) -> None:
     client = DaemonClient()
-    client._compatible_socket = (7, 11)
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(client, "_socket_identity", lambda: (7, 11))
 
     def legacy_send(payload: dict[str, object], _timeout: int) -> list[bytes]:
         sent.append(payload)
