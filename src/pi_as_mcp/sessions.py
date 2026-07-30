@@ -656,6 +656,11 @@ class PiAgentSession:
         self._prompts: list[PromptRecord] = []
         self._transcript: list[TranscriptItem] = []
         self._final_text = ""
+        # Keep the completed answer visible while a follow-up is running, but
+        # separately track whether that follow-up produced assistant text. At
+        # its boundary an empty/error turn must replace, not inherit, the last
+        # completed answer.
+        self._turn_final_text = ""
         self._turn_count = 0
         self._running = False
         self._status = "starting"
@@ -930,6 +935,7 @@ class PiAgentSession:
                         # hand callers a stale echo instead of a failure. Clear
                         # it and surface an explicit error.
                         self._final_text = ""
+                        self._turn_final_text = ""
                         if self._error is None:
                             self._record_provider_error_locked(
                                 "Pi worker exited mid-turn without producing a response"
@@ -982,6 +988,7 @@ class PiAgentSession:
 
             if event_type == "agent_start":
                 self._set_status_locked("running", "Pi turn started")
+                self._turn_final_text = ""
                 # A fresh attempt is underway; drop any error from a prior turn so
                 # a recovered/re-delegated agent doesn't report a stale failure.
                 self._clear_error_locked()
@@ -996,6 +1003,7 @@ class PiAgentSession:
                 self._record_message_locked("message_end", event.get("message"))
                 text = assistant_message_text(event.get("message"))
                 if text:
+                    self._turn_final_text = text
                     self._final_text = text
                     self._touch_locked("received assistant message")
 
@@ -1006,6 +1014,7 @@ class PiAgentSession:
                 self._record_message_locked("turn_end", event.get("message"))
                 text = assistant_message_text(event.get("message"))
                 if text:
+                    self._turn_final_text = text
                     self._final_text = text
                     self._touch_locked("turn ended")
 
@@ -1068,7 +1077,9 @@ class PiAgentSession:
                         recorded_usage = self._record_usage_from_message_locked(message) or recorded_usage
                     text = last_assistant_text(messages)
                     if text:
-                        self._final_text = text
+                        self._turn_final_text = text
+                self._final_text = self._turn_final_text
+                self._turn_final_text = ""
                 if not recorded_usage:
                     self._record_usage_from_event_locked(event)
                 self._turn_count += 1
