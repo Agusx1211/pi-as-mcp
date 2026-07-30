@@ -9,6 +9,7 @@ import signal
 import socket
 import socketserver
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -35,6 +36,21 @@ _DARWIN_PEERPID_FORMAT = "=i"
 # release, so retain their stable XNU values as fallbacks.
 _DARWIN_SOL_LOCAL = 0
 _DARWIN_LOCAL_PEERPID = 0x002
+_CLI_SHELL_NAMES = frozenset(
+    {
+        "ash",
+        "bash",
+        "dash",
+        "fish",
+        "ksh",
+        "mksh",
+        "nu",
+        "pwsh",
+        "sh",
+        "xonsh",
+        "zsh",
+    }
+)
 
 
 def _peer_pid_from_sockopt(
@@ -113,10 +129,52 @@ def exposed_model_aliases() -> list[dict[str, Any]]:
     return rows
 
 
+def _darwin_process_details(pid: int) -> tuple[int | None, str | None, str | None]:
+    try:
+        completed = subprocess.run(
+            [
+                "ps",
+                "-ww",
+                "-p",
+                str(pid),
+                "-o",
+                "ppid=",
+                "-o",
+                "lstart=",
+                "-o",
+                "command=",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, None, None
+    if completed.returncode != 0:
+        return None, None, None
+    # With LC_ALL=C, lstart is the fixed five-field form
+    # "Thu Jul 30 13:20:00 2026". The command occupies the remaining field.
+    fields = completed.stdout.strip().split(maxsplit=6)
+    if len(fields) < 6:
+        return None, None, None
+    try:
+        ppid = int(fields[0])
+    except ValueError:
+        return None, None, None
+    start_time = " ".join(fields[1:6])
+    command = fields[6] if len(fields) == 7 else ""
+    return ppid, start_time, command
+
+
 def proc_stat(pid: int) -> tuple[int | None, str | None]:
     try:
         content = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
+        if sys.platform == "darwin":
+            ppid, start_time, _command = _darwin_process_details(pid)
+            return ppid, start_time
         return None, None
     end = content.rfind(")")
     if end == -1:
@@ -147,6 +205,7 @@ class ParentIdentity:
     owner_pid: int | None
     label: str
     peer_pid: int | None = None
+    owner_start_time: str | None = None
 
 
 @dataclass
@@ -175,8 +234,11 @@ def proc_cmdline(pid: int) -> str | None:
 def process_info(pid: int | None) -> dict[str, Any] | None:
     if not pid:
         return None
-    ppid, start_time = proc_stat(pid)
-    command = proc_cmdline(pid)
+    if sys.platform == "darwin":
+        ppid, start_time, command = _darwin_process_details(pid)
+    else:
+        ppid, start_time = proc_stat(pid)
+        command = proc_cmdline(pid)
     if ppid is None and command is None:
         return None
     return {
@@ -200,6 +262,52 @@ def process_lineage(pid: int | None, *, limit: int = 8) -> list[dict[str, Any]]:
         next_pid = info.get("ppid")
         current = next_pid if isinstance(next_pid, int) and next_pid > 1 else None
     return lineage
+
+
+def process_identity_matches(pid: int | None, start_time: str | None) -> bool:
+    if not pid_exists(pid):
+        return False
+    if not start_time or pid is None:
+        return True
+    _ppid, current_start_time = proc_stat(pid)
+    # A transient metadata read failure is not evidence that the owner died.
+    # Keep it alive for another reaper pass rather than terminating live work.
+    if current_start_time is None:
+        return True
+    return current_start_time == start_time
+
+
+def _is_cli_shell(command: str) -> bool:
+    executable = command.split(maxsplit=1)[0] if command else ""
+    name = Path(executable).name.lstrip("-")
+    return name in _CLI_SHELL_NAMES
+
+
+def cli_parent_identity_from_peer(peer_pid: int) -> ParentIdentity:
+    current_pid: int | None = peer_pid
+    seen: set[int] = set()
+    while current_pid and current_pid not in seen:
+        seen.add(current_pid)
+        info = process_info(current_pid)
+        if info is None:
+            break
+        if current_pid != peer_pid and _is_cli_shell(str(info.get("command") or "")):
+            start_time = info.get("start_time")
+            if not isinstance(start_time, str) or not start_time:
+                break
+            return ParentIdentity(
+                scope_id=hash_scope(f"cli-shell:{current_pid}:{start_time}"),
+                owner_pid=current_pid,
+                label=f"cli-shell:{current_pid}",
+                peer_pid=peer_pid,
+                owner_start_time=start_time,
+            )
+        ppid = info.get("ppid")
+        current_pid = ppid if isinstance(ppid, int) and ppid > 1 else None
+    raise PiRpcError(
+        "could not determine a stable CLI shell scope from the client process tree; "
+        "set PI_AGENT_PARENT_ID=<name> to choose an explicit scope"
+    )
 
 
 def requester_instance(label: str) -> str:
@@ -293,7 +401,15 @@ def parent_identity_from_peer(
     peer_pid: int,
     parent_hint: str | None = None,
     parent_owner_pid: int | None = None,
+    parent_scope_mode: str | None = None,
 ) -> ParentIdentity:
+    if parent_scope_mode is not None:
+        if parent_scope_mode != "cli-shell":
+            raise PiRpcError(f"unsupported parent_scope_mode: {parent_scope_mode}")
+        if parent_hint or parent_owner_pid is not None:
+            raise PiRpcError("parent_scope_mode cannot be combined with an explicit parent identity")
+        return cli_parent_identity_from_peer(peer_pid)
+
     if parent_hint:
         if not SAFE_HINT_RE.match(parent_hint):
             raise PiRpcError("parent_hint contains unsupported characters")
@@ -304,6 +420,9 @@ def parent_identity_from_peer(
             owner_pid=parent_owner_pid,
             label=f"hint:{parent_hint}",
             peer_pid=peer_pid,
+            owner_start_time=proc_stat(parent_owner_pid)[1]
+            if parent_owner_pid is not None
+            else None,
         )
 
     _ppid, fallback_start = proc_stat(peer_pid)
@@ -802,7 +921,9 @@ class DaemonState:
                 dead_scope_ids = []
                 for scope_id, identity in self._identities.items():
                     if identity.owner_pid is not None:
-                        if not pid_exists(identity.owner_pid):
+                        if not process_identity_matches(
+                            identity.owner_pid, identity.owner_start_time
+                        ):
                             dead_scope_ids.append(scope_id)
                         continue
                     # Scopes without an owner pid (CLI peers, bare hints) keep
@@ -856,6 +977,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
             peer_pid,
             parent_hint if isinstance(parent_hint, str) else None,
             optional_positive_int(request, "parent_owner_pid"),
+            optional_str(request, "parent_scope_mode"),
         )
         scoped_manager: SessionManager | None = None
 

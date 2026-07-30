@@ -233,6 +233,29 @@ def test_format_percent_does_not_rescale_small_values() -> None:
 # --- daemon client: non-idempotent requests must not be resent --------------
 
 
+def test_client_uses_shell_scope_unless_explicit_parent_id_is_set(
+    monkeypatch,
+) -> None:
+    client = DaemonClient(default_scope_mode="cli-shell")
+    sends: list[dict] = []
+
+    def fake_send(payload, timeout):
+        sends.append(payload)
+        return [b"{}"]
+
+    monkeypatch.setattr(client, "_send", fake_send)
+    monkeypatch.delenv("PI_AGENT_PARENT_ID", raising=False)
+    client.request("summary")
+
+    monkeypatch.setenv("PI_AGENT_PARENT_ID", "shared-build")
+    client.request("summary")
+
+    assert sends[0]["parent_scope_mode"] == "cli-shell"
+    assert "parent_hint" not in sends[0]
+    assert sends[1]["parent_hint"] == "shared-build"
+    assert "parent_scope_mode" not in sends[1]
+
+
 def test_client_does_not_resend_after_post_connect_failure(monkeypatch) -> None:
     # A recv timeout (socket.timeout is an OSError) used to trigger
     # start_daemon() plus a blind re-send, duplicating delegate/reply commands.

@@ -138,9 +138,16 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
-    client = DaemonClient()
+    command = args.command
+    needs_cli_scope = command in {"start", "delegate"} or (
+        command in {"summary", "list"} and args.scoped
+    )
+    client = (
+        DaemonClient(default_scope_mode="cli-shell")
+        if needs_cli_scope
+        else DaemonClient()
+    )
     try:
-        command = args.command
         if command in {"start", "delegate"}:
             print_json(
                 client.request(
