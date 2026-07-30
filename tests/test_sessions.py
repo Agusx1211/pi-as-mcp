@@ -523,6 +523,15 @@ for line in sys.stdin:
     session = manager._get(started.agent_id)
     assert session.process is not None
     first_pid = session.process.pid
+    with session._lock:
+        original_idle_eviction_seconds = session.idle_eviction_seconds
+        session.idle_eviction_seconds = 0.01
+        stale_eviction = session._watchdog_action_locked(
+            session.last_activity_monotonic + 1
+        )
+        session.idle_eviction_seconds = original_idle_eviction_seconds
+    assert stale_eviction is not None
+    assert stale_eviction.kind == "evict"
 
     # Evict: the worker process is killed, but the agent stays idle/resumable.
     session._evict()
@@ -552,9 +561,241 @@ for line in sys.stdin:
     assert len(launch_lines) == 2  # original + respawn
     assert session.process is not None
     assert session.process.pid != first_pid
+    replacement = session.process
+
+    # A watchdog action captured for the first worker must not apply to the
+    # replacement, even if its idle timing would otherwise look eligible.
+    with session._lock:
+        current_activity = session.last_activity_monotonic
+        session.idle_eviction_seconds = stale_eviction.threshold_seconds
+        session.last_activity_monotonic = stale_eviction.last_activity_monotonic
+        assert session._evict(stale_eviction) is False
+        session.idle_eviction_seconds = original_idle_eviction_seconds
+        session.last_activity_monotonic = current_activity
+    assert session.process is replacement
+    assert replacement.poll() is None
 
     stopped = manager.stop(started.agent_id)
     assert stopped.status == "stopped"
+
+
+def test_watchdog_rechecks_idle_eviction_after_reply_starts(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(
+        tmp_path,
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+turn = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("type") == "abort":
+        break
+    turn += 1
+    print(json.dumps({"id": request["id"], "type": "response", "command": "prompt", "success": True}), flush=True)
+    print(json.dumps({"type": "agent_start"}), flush=True)
+    if turn == 1:
+        message = {"role": "assistant", "content": [{"type": "text", "text": "first done"}]}
+        print(json.dumps({"type": "message_end", "message": message}), flush=True)
+        print(json.dumps({"type": "agent_end", "messages": [message]}), flush=True)
+""",
+    )
+    manager = SessionManager(session_dir=tmp_path / "sessions", idle_eviction_seconds=1000)
+    manager._runner.pi_bin = str(fake_pi)
+    started = manager.start(
+        prompt="one",
+        cwd=str(tmp_path),
+        model="local/example-model",
+        provider=None,
+        tool_mode="none",
+        include_events=False,
+    )
+    done, timed_out = manager.listen(started.agent_id, after_turn_count=0, timeout_seconds=5)
+    assert timed_out is False
+    assert done.status == "idle"
+
+    session = manager._get(started.agent_id)
+    process = session.process
+    assert process is not None
+    decision_made = threading.Event()
+    apply_decision = threading.Event()
+    decision_applied = threading.Event()
+    original_evict = session._evict
+
+    def delay_evict(action=None):
+        assert action is not None
+        decision_made.set()
+        assert apply_decision.wait(timeout=5)
+        try:
+            return original_evict(action)
+        finally:
+            decision_applied.set()
+
+    session._evict = delay_evict  # type: ignore[method-assign]
+    try:
+        with session._lock:
+            session.idle_eviction_seconds = 0.01
+            session.last_activity_monotonic = time.monotonic() - 1
+        assert decision_made.wait(timeout=5), "watchdog did not decide to evict"
+
+        # The reply is fully accepted while the watchdog is paused between its
+        # decision and action. Applying that stale decision must leave the
+        # active turn and its original process alone.
+        reply = manager.reply(started.agent_id, prompt="two", behavior="auto")
+        assert reply.status == "running"
+        apply_decision.set()
+        assert decision_applied.wait(timeout=5)
+        assert manager.peek(started.agent_id).status == "running"
+        assert session.process is process
+        assert process.poll() is None
+        assert session._evicted is False
+    finally:
+        apply_decision.set()
+        manager.close()
+
+
+def test_watchdog_rechecks_stall_after_new_activity(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(
+        tmp_path,
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("type") == "abort":
+        break
+    print(json.dumps({"id": request["id"], "type": "response", "command": "prompt", "success": True}), flush=True)
+    print(json.dumps({"type": "agent_start"}), flush=True)
+""",
+    )
+    manager = SessionManager()
+    manager._runner.pi_bin = str(fake_pi)
+    started = manager.start(
+        prompt="keep running",
+        cwd=str(tmp_path),
+        model="local/example-model",
+        provider=None,
+        tool_mode="none",
+        include_events=False,
+    )
+    session = manager._get(started.agent_id)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if manager.peek(started.agent_id).status == "running":
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("fake Pi did not start")
+
+    process = session.process
+    assert process is not None
+    decision_made = threading.Event()
+    apply_decision = threading.Event()
+    decision_applied = threading.Event()
+    original_timeout = session._timeout_if_still_stalled
+
+    def delay_timeout(action):
+        decision_made.set()
+        assert apply_decision.wait(timeout=5)
+        try:
+            return original_timeout(action)
+        finally:
+            decision_applied.set()
+
+    session._timeout_if_still_stalled = delay_timeout  # type: ignore[method-assign]
+    try:
+        with session._lock:
+            session.inactivity_timeout_seconds = 0.01
+            session.last_activity_monotonic = time.monotonic() - 1
+        assert decision_made.wait(timeout=5), "watchdog did not detect the stall"
+
+        # A token arrives after the watchdog's decision but before it acts.
+        # The refreshed activity timestamp invalidates the timeout candidate.
+        session._handle_stdout_line(
+            json.dumps(
+                {
+                    "type": "message_update",
+                    "delta": {"type": "text_delta", "text": "still working"},
+                }
+            )
+        )
+        apply_decision.set()
+        assert decision_applied.wait(timeout=5)
+        snapshot = manager.peek(started.agent_id)
+        assert snapshot.status == "running"
+        assert snapshot.error is None
+        assert session.process is process
+        assert process.poll() is None
+    finally:
+        apply_decision.set()
+        manager.close()
+
+
+def test_watchdog_evicts_worker_when_idle_state_is_unchanged(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(
+        tmp_path,
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("type") == "abort":
+        break
+    print(json.dumps({"id": request["id"], "type": "response", "command": "prompt", "success": True}), flush=True)
+    print(json.dumps({"type": "agent_start"}), flush=True)
+    message = {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+    print(json.dumps({"type": "message_end", "message": message}), flush=True)
+    print(json.dumps({"type": "agent_end", "messages": [message]}), flush=True)
+""",
+    )
+    manager = SessionManager(session_dir=tmp_path / "sessions", idle_eviction_seconds=1000)
+    manager._runner.pi_bin = str(fake_pi)
+    started = manager.start(
+        prompt="one",
+        cwd=str(tmp_path),
+        model="local/example-model",
+        provider=None,
+        tool_mode="none",
+        include_events=False,
+    )
+    done, timed_out = manager.listen(started.agent_id, after_turn_count=0, timeout_seconds=5)
+    assert timed_out is False
+    assert done.status == "idle"
+
+    session = manager._get(started.agent_id)
+    process = session.process
+    assert process is not None
+    with session._lock:
+        session.idle_eviction_seconds = 0.01
+        session.last_activity_monotonic = time.monotonic() - 1
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if session._evicted and process.poll() is not None:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("watchdog did not evict unchanged idle worker")
+    assert manager.peek(started.agent_id).status == "idle"
+    assert process.poll() is not None
+    manager.close()
 
 
 def test_unsafe_read_only_flag_opens_full_tools_and_guards_prompt(tmp_path: Path) -> None:

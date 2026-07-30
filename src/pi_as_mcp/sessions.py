@@ -84,6 +84,17 @@ DEFAULT_IDLE_EVICTION_SECONDS = 120
 TranscriptSink = Callable[[str, dict[str, Any]], None]
 
 
+@dataclass(frozen=True)
+class _WatchdogAction:
+    """State observed when the watchdog decides a worker may be reclaimed."""
+
+    kind: Literal["stall", "evict"]
+    process: subprocess.Popen[str]
+    process_generation: int
+    last_activity_monotonic: float
+    threshold_seconds: float
+
+
 def text_preview(text: str, limit: int = 240) -> str:
     compact = " ".join(text.split())
     if len(compact) <= limit:
@@ -680,6 +691,9 @@ class PiAgentSession:
         # per token. Only ever touched by the stdout reader thread.
         self._stream_buffer = ""
         self.process: subprocess.Popen[str] | None = None
+        # Incremented for every worker spawn so a delayed watchdog decision can
+        # never be applied to a replacement process.
+        self._process_generation = 0
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
 
@@ -750,6 +764,7 @@ class PiAgentSession:
             start_new_session=os.name == "posix",
         )
         self.process = process
+        self._process_generation += 1
         self._evicted = False
         self._responses.clear()
         self._stdout_thread = threading.Thread(target=self._read_stdout, args=(process,), daemon=True)
@@ -1407,43 +1422,104 @@ class PiAgentSession:
         # cycles); it returns only when the agent is permanently closed.
         while True:
             time.sleep(0.25)
-            action: str | None = None
+            action: _WatchdogAction | None = None
             with self._lock:
                 if self._closed:
                     return
-                process = self.process
-                alive = process is not None and process.poll() is None
-                idle_seconds = time.monotonic() - self.last_activity_monotonic
-                # Inactivity, not wall-clock: a running turn that keeps streaming
-                # tokens, calling tools, or returning results refreshes
-                # last_activity and never trips this. Only a running turn that
-                # goes silent for the whole window is treated as stalled.
-                if self._running and alive and idle_seconds > self.inactivity_timeout_seconds:
-                    action = "stall"
-                # An idle (turn finished) worker that has sat quiet past the grace
-                # window is evicted: kill the process to reclaim memory while the
-                # persisted session keeps it resumable on the next reply.
-                elif (
-                    alive
-                    and not self._running
-                    and not self._evicted
-                    and self._persist_enabled
-                    and self.idle_eviction_seconds > 0
-                    and idle_seconds > self.idle_eviction_seconds
-                ):
-                    action = "evict"
+                action = self._watchdog_action_locked(time.monotonic())
 
-            if action == "stall":
-                with self._condition:
-                    self._error = f"Pi RPC stalled: no activity for {self.inactivity_timeout_seconds}s"
-                    self._set_status_locked("timeout", self._error)
-                    self._condition.notify_all()
-                self._terminate(mark_status="timeout")
-                return
-            if action == "evict":
-                self._evict()
+            if action is None:
+                continue
+            if action.kind == "stall":
+                if self._timeout_if_still_stalled(action):
+                    return
+            else:
+                self._evict(action)
 
-    def _evict(self) -> None:
+    def _watchdog_action_locked(self, now: float) -> _WatchdogAction | None:
+        process = self.process
+        if process is None or process.poll() is not None:
+            return None
+        idle_seconds = now - self.last_activity_monotonic
+        # Inactivity, not wall-clock: a running turn that keeps streaming
+        # tokens, calling tools, or returning results refreshes last_activity
+        # and never trips this. Only a running turn that goes silent for the
+        # whole window is treated as stalled.
+        if self._running and idle_seconds > self.inactivity_timeout_seconds:
+            kind: Literal["stall", "evict"] = "stall"
+            threshold_seconds = self.inactivity_timeout_seconds
+        # An idle (turn finished) worker that has sat quiet past the grace
+        # window is evicted: kill the process to reclaim memory while the
+        # persisted session keeps it resumable on the next reply.
+        elif (
+            not self._running
+            and not self._evicted
+            and self._persist_enabled
+            and self.idle_eviction_seconds > 0
+            and idle_seconds > self.idle_eviction_seconds
+        ):
+            kind = "evict"
+            threshold_seconds = self.idle_eviction_seconds
+        else:
+            return None
+        return _WatchdogAction(
+            kind=kind,
+            process=process,
+            process_generation=self._process_generation,
+            last_activity_monotonic=self.last_activity_monotonic,
+            threshold_seconds=threshold_seconds,
+        )
+
+    def _watchdog_process_is_current_locked(self, action: _WatchdogAction) -> bool:
+        process = self.process
+        return (
+            process is action.process
+            and self._process_generation == action.process_generation
+            and process is not None
+            and process.poll() is None
+        )
+
+    def _timeout_if_still_stalled(self, action: _WatchdogAction) -> bool:
+        """Apply a stall decision only if its process and inactivity are current."""
+        observer_event: tuple[str, SessionSnapshot] | None = None
+        with self._condition:
+            idle_seconds = time.monotonic() - self.last_activity_monotonic
+            if (
+                action.kind != "stall"
+                or self._closed
+                or self._evicted
+                or not self._running
+                or not self._watchdog_process_is_current_locked(action)
+                or self.last_activity_monotonic != action.last_activity_monotonic
+                or self.inactivity_timeout_seconds != action.threshold_seconds
+                or self.inactivity_timeout_seconds <= 0
+                or idle_seconds <= self.inactivity_timeout_seconds
+            ):
+                return False
+
+            self._closed = True
+            self._error = (
+                f"Pi RPC stalled: no activity for {self.inactivity_timeout_seconds}s"
+            )
+            self._set_status_locked("timeout", self._error)
+            self.current_tool = None
+            observer_event = (
+                "agent_updated",
+                self._snapshot_locked(include_events=False),
+            )
+            self._condition.notify_all()
+
+        self._emit_transcript(
+            "status",
+            {"status": "timeout", "error": self._error or ""},
+            turn=self._turn_count + 1,
+        )
+        self._kill_process(action.process)
+        if observer_event is not None:
+            self._notify_observer(*observer_event)
+        return True
+
+    def _evict(self, action: _WatchdogAction | None = None) -> bool:
         """Kill an idle worker to reclaim memory while keeping the agent resumable.
 
         The conversation is already on disk (Pi appends each entry synchronously),
@@ -1452,8 +1528,26 @@ class PiAgentSession:
         observer_event: tuple[str, SessionSnapshot] | None = None
         with self._condition:
             process = self.process
-            if self._closed or self._evicted or process is None or process.poll() is not None:
-                return
+            if (
+                self._closed
+                or self._evicted
+                or self._running
+                or not self._persist_enabled
+                or process is None
+                or process.poll() is not None
+            ):
+                return False
+            if action is not None:
+                idle_seconds = time.monotonic() - self.last_activity_monotonic
+                if (
+                    action.kind != "evict"
+                    or not self._watchdog_process_is_current_locked(action)
+                    or self.last_activity_monotonic != action.last_activity_monotonic
+                    or self.idle_eviction_seconds != action.threshold_seconds
+                    or self.idle_eviction_seconds <= 0
+                    or idle_seconds <= self.idle_eviction_seconds
+                ):
+                    return False
             self._evicted = True
             self._running = False
             self.current_tool = None
@@ -1463,6 +1557,7 @@ class PiAgentSession:
         self._kill_process(process)
         if observer_event is not None:
             self._notify_observer(*observer_event)
+        return True
 
     def _kill_process(self, process: subprocess.Popen[str] | None) -> None:
         if process is None or process.poll() is not None:
