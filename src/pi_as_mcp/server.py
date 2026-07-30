@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import uuid
@@ -105,8 +104,21 @@ class SessionSnapshotResult(SessionSnapshotBase, SessionSnapshotOptional):
 
 
 def ensure_wait_shim() -> str:
-    path = runtime_dir() / "piw"
-    body = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -m pi_as_mcp.cli wait \"$@\"\n"
+    path = runtime_dir().absolute() / "piw"
+    body = (
+        "#!/bin/sh\n"
+        'pi_as_mcp_wait_shim=$0\n'
+        'case "$pi_as_mcp_wait_shim" in\n'
+        "  */*) ;;\n"
+        '  *) pi_as_mcp_wait_shim=$(command -v "$pi_as_mcp_wait_shim") || exit 1 ;;\n'
+        "esac\n"
+        'pi_as_mcp_runtime_dir=${pi_as_mcp_wait_shim%/*}\n'
+        "PI_AS_MCP_RUNTIME_DIR=$(\n"
+        '  CDPATH= cd -P "$pi_as_mcp_runtime_dir" && pwd\n'
+        ") || exit 1\n"
+        "export PI_AS_MCP_RUNTIME_DIR\n"
+        f"exec {shlex.quote(sys.executable)} -m pi_as_mcp.cli wait \"$@\"\n"
+    )
     if not path.exists() or path.read_text(encoding="utf-8") != body:
         # Write atomically with the mode already set, so a crash can never
         # leave a correct-looking but non-executable shim that the content
@@ -122,7 +134,10 @@ def ensure_wait_shim() -> str:
 
 
 def wait_command(agent_id: str, *, after_turn_count: int = 0) -> str:
-    parts = ["piw" if shutil.which("piw") else ensure_wait_shim(), agent_id]
+    # Always use the namespace-owned shim. A `piw` found on PATH may belong to
+    # another installation, and cannot recover a custom runtime namespace once
+    # the MCP server's environment is no longer present in the parent shell.
+    parts = [ensure_wait_shim(), agent_id]
     if after_turn_count > 0:
         parts.extend(["-a", str(after_turn_count)])
     return " ".join(shlex.quote(part) for part in parts)
