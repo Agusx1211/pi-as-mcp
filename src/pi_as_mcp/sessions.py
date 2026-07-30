@@ -674,6 +674,10 @@ class PiAgentSession:
         # completed answer.
         self._turn_final_text = ""
         self._turn_count = 0
+        # Follow-ups accepted while a turn is running execute as later turns.
+        # Keep them explicit so the brief agent_end -> agent_start gap remains
+        # concurrency-counted and cannot be mistaken for evictable idle time.
+        self._queued_followups = 0
         self._running = False
         self._status = "starting"
         # Number of parents currently blocked in listen() on this agent — i.e.
@@ -824,10 +828,16 @@ class PiAgentSession:
             # Respawn a worker that was evicted (or exited) while idle, resuming
             # its persisted session so this reply continues the same conversation.
             self._ensure_worker_locked()
-            is_running = self._running
+            # A queued follow-up is still active work even during the brief gap
+            # after the prior agent_end. Additional automatic replies must join
+            # that queue instead of being sent as unrelated immediate prompts.
+            is_running = self._running or self._queued_followups > 0
             turn_count_before = self._turn_count
             turn = turn_count_before + 1
             effective_behavior = self._effective_behavior(behavior, is_running=is_running)
+            queued_followup = effective_behavior == "follow-up" and is_running
+            if queued_followup:
+                self._queued_followups += 1
             prompt_record = PromptRecord(turn=turn, behavior=effective_behavior, text=prompt)
             self._prompts.append(prompt_record)
             self._append_transcript_locked(
@@ -863,12 +873,18 @@ class PiAgentSession:
                 process.stdin.write(json.dumps(command, ensure_ascii=False) + "\n")
                 process.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
+                if queued_followup:
+                    with self._lock:
+                        self._release_queued_followup_locked()
                 raise PiRpcError(f"agent {self.agent_id} pipe closed") from exc
 
         response = self._wait_for_response(request_id, timeout=PROMPT_ACK_TIMEOUT_SECONDS)
         with self._lock:
             prompt_record.accepted = bool(response.get("success"))
         if not response.get("success"):
+            if queued_followup:
+                with self._lock:
+                    self._release_queued_followup_locked()
             raise PiRpcError(str(response.get("error") or "Pi rejected prompt"))
         with self._lock:
             if self._turn_count == turn_count_before and self._status not in {"error", "timeout", "stopped"}:
@@ -879,6 +895,10 @@ class PiAgentSession:
         response["turn_count_before"] = turn_count_before
         response["was_running"] = is_running
         return response
+
+    def _release_queued_followup_locked(self) -> None:
+        if self._queued_followups > 0:
+            self._queued_followups -= 1
 
     def snapshot(self, *, include_events: bool | None = None) -> SessionSnapshot:
         with self._lock:
@@ -962,7 +982,11 @@ class PiAgentSession:
                     and not self._evicted
                     and self._status not in {"error", "timeout", "stopped"}
                 ):
-                    if self._status in {"starting", "running"}:
+                    # Any accepted follow-ups lived only in this worker's
+                    # in-memory queue and cannot survive an unexpected exit.
+                    had_queued_followups = self._queued_followups > 0
+                    self._queued_followups = 0
+                    if self._status in {"starting", "running"} or had_queued_followups:
                         # The worker died mid-turn: final_text still holds a
                         # previous turn's answer (it is only overwritten when a
                         # new assistant message arrives), so returning it would
@@ -1021,6 +1045,7 @@ class PiAgentSession:
                 return
 
             if event_type == "agent_start":
+                self._release_queued_followup_locked()
                 self._set_status_locked("running", "Pi turn started")
                 self._turn_final_text = ""
                 # A fresh attempt is underway; drop any error from a prior turn so
@@ -1193,6 +1218,8 @@ class PiAgentSession:
             status = "exited"
         elif self._running:
             status = "running"
+        elif self._queued_followups:
+            status = "starting"
         elif status in {"starting", "running"}:
             status = "idle"
         return status
@@ -1455,7 +1482,10 @@ class PiAgentSession:
         # tokens, calling tools, or returning results refreshes last_activity
         # and never trips this. Only a running turn that goes silent for the
         # whole window is treated as stalled.
-        if self._running and idle_seconds > self.inactivity_timeout_seconds:
+        if (
+            (self._running or self._queued_followups)
+            and idle_seconds > self.inactivity_timeout_seconds
+        ):
             kind: Literal["stall", "evict"] = "stall"
             threshold_seconds = self.inactivity_timeout_seconds
         # An idle (turn finished) worker that has sat quiet past the grace
@@ -1495,7 +1525,7 @@ class PiAgentSession:
                 action.kind != "stall"
                 or self._closed
                 or self._evicted
-                or not self._running
+                or not (self._running or self._queued_followups)
                 or not self._watchdog_process_is_current_locked(action)
                 or self.last_activity_monotonic != action.last_activity_monotonic
                 or self.inactivity_timeout_seconds != action.threshold_seconds
@@ -1505,6 +1535,7 @@ class PiAgentSession:
                 return False
 
             self._closed = True
+            self._queued_followups = 0
             self._error = (
                 f"Pi RPC stalled: no activity for {self.inactivity_timeout_seconds}s"
             )
@@ -1539,6 +1570,7 @@ class PiAgentSession:
                 self._closed
                 or self._evicted
                 or self._running
+                or self._queued_followups
                 or not self._persist_enabled
                 or process is None
                 or process.poll() is not None
@@ -1599,6 +1631,7 @@ class PiAgentSession:
             if self._closed:
                 return
             self._closed = True
+            self._queued_followups = 0
             process = self.process
             self._set_status_locked(mark_status, reason or mark_status)
             self.current_tool = None

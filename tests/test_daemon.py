@@ -338,6 +338,57 @@ for line in sys.stdin:
     return path
 
 
+def write_gapped_followup_fake_pi(tmp_path: Path) -> tuple[Path, Path]:
+    """A worker that exposes the gap between one turn ending and its queued
+    follow-up starting."""
+    path = tmp_path / "fake-pi-gapped-followup"
+    release_followup = tmp_path / "release-followup"
+    entered_gap = tmp_path / "entered-followup-gap"
+    path.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+import time
+
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    message = request["message"]
+    print(json.dumps({{
+        "id": request["id"],
+        "type": "response",
+        "command": "prompt",
+        "success": True,
+    }}), flush=True)
+    if message.startswith("idle"):
+        print(json.dumps({{"type": "agent_start"}}), flush=True)
+        answer = {{
+            "role": "assistant",
+            "content": [{{"type": "text", "text": "idle now"}}],
+        }}
+        print(json.dumps({{"type": "agent_end", "messages": [answer]}}), flush=True)
+    elif message == "run held":
+        print(json.dumps({{"type": "agent_start"}}), flush=True)
+    elif message == "queued":
+        print(json.dumps({{"type": "agent_end", "messages": []}}), flush=True)
+        pathlib.Path({str(entered_gap)!r}).touch()
+        while not pathlib.Path({str(release_followup)!r}).exists():
+            time.sleep(0.01)
+        print(json.dumps({{"type": "agent_start"}}), flush=True)
+    else:
+        print(json.dumps({{"type": "agent_start"}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path, release_followup
+
+
 def write_recording_fake_pi(tmp_path: Path) -> Path:
     path = tmp_path / "fake-pi-recording"
     path.write_text(
@@ -1037,6 +1088,142 @@ def test_daemon_concurrent_idle_replies_respect_limit_and_running_reply_is_allow
         assert snapshot.status == "running"
         assert ack["was_running"] is True
     finally:
+        state.close()
+
+
+def test_queued_followup_holds_concurrency_slot_across_turn_gap(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_pi, release_followup = write_gapped_followup_fake_pi(tmp_path)
+    entered_gap = tmp_path / "entered-followup-gap"
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "persist_sessions": True,
+                    "idle_eviction_seconds": 0.05,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    monkeypatch.setenv("PI_AS_MCP_SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="queued-gap-scope", owner_pid=None, label="queued-gap")
+    try:
+        manager = state.manager_for(identity)
+        manager._runner.pi_bin = str(fake_pi)
+
+        agent_ids: list[str] = []
+        for prompt in ("idle first", "idle second"):
+            started = state.start(
+                identity,
+                prompt=prompt,
+                cwd=str(tmp_path),
+                model="local/example-model",
+                provider=None,
+                tool_mode="none",
+                include_events=False,
+            )
+            agent_id = str(started["agent_id"])
+            agent_ids.append(agent_id)
+            done, timed_out = manager.listen(
+                agent_id,
+                after_turn_count=0,
+                timeout_seconds=5,
+            )
+            assert timed_out is False
+            assert done.status == "idle"
+
+        # Exercise live config reload at the same time the reply path begins
+        # enforcing its newly configured slot.
+        config.write_text(
+            json.dumps(
+                {
+                    "agents": {
+                        "persist_sessions": True,
+                        "idle_eviction_seconds": 0.05,
+                        "concurrency_limits": {"models": {"example-model": 1}},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        first_id, second_id = agent_ids
+        running, _ack, _target = state.reply(
+            identity,
+            agent_id=first_id,
+            prompt="run held",
+            behavior="auto",
+        )
+        assert running.status == "running"
+
+        def fail_telemetry(*args, **kwargs) -> None:
+            raise OSError("telemetry unavailable during queued reply")
+
+        monkeypatch.setattr(state._stats, "record_agent_snapshot", fail_telemetry)
+        monkeypatch.setattr(state._stats, "append_transcript", fail_telemetry)
+
+        queued, queued_ack, _target = state.reply(
+            identity,
+            agent_id=first_id,
+            prompt="queued",
+            behavior="auto",
+        )
+        assert queued_ack["was_running"] is True
+        assert queued.status in {"running", "starting"}
+
+        deadline = time.monotonic() + 5
+        while not entered_gap.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert entered_gap.exists()
+
+        # Leave the worker in the turn gap long enough that the live 50ms
+        # eviction policy would reclaim it if the queued follow-up looked idle.
+        time.sleep(0.35)
+        first = manager.peek(first_id)
+        assert first.status == "starting"
+        assert manager._get(first_id).process is not None
+        assert manager._get(first_id).process.poll() is None
+
+        with pytest.raises(PiRpcError, match="concurrency limit reached"):
+            state.reply(
+                identity,
+                agent_id=second_id,
+                prompt="must remain blocked",
+                behavior="auto",
+            )
+
+        assert state.stats_summary()["telemetry"]["healthy"] is False
+
+        # Starting the queued turn consumes the pending marker. Once that agent
+        # stops, the other idle agent can claim the slot normally.
+        release_followup.touch()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if manager.peek(first_id).status == "running":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("queued follow-up never started")
+        assert manager._get(first_id)._queued_followups == 0
+
+        manager.stop(first_id)
+        resumed, _ack, _target = state.reply(
+            identity,
+            agent_id=second_id,
+            prompt="now allowed",
+            behavior="auto",
+        )
+        assert resumed.status == "running"
+    finally:
+        release_followup.touch()
         state.close()
 
 
