@@ -6,6 +6,7 @@ Each test pins the fixed behavior; the comment above it describes the bug.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import socket
 import stat
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from pi_as_mcp import cli, daemon_client, paths, server, sessions
+from pi_as_mcp import cli, daemon, daemon_client, paths, server, sessions
 from pi_as_mcp.config import parse_app_config
 from pi_as_mcp.config_tui import ConfigDraft
 from pi_as_mcp.daemon_client import DaemonClient, DaemonClientError
@@ -269,6 +270,33 @@ def test_client_retries_once_on_connect_failure(monkeypatch) -> None:
     assert daemon_starts == [True]
 
 
+def test_client_retries_repeated_connect_failures_with_backoff(monkeypatch) -> None:
+    client = DaemonClient()
+    sends: list = []
+    delays: list[float] = []
+
+    def fake_send(payload, timeout):
+        sends.append(payload)
+        if len(sends) < 4:
+            raise daemon_client._DaemonConnectError("accept queue busy")
+        return [json.dumps({"agent_id": "a1"}).encode("utf-8")]
+
+    def fake_backoff(delay, deadline):
+        delays.append(delay)
+        return delay * 2
+
+    monkeypatch.setattr(client, "_send", fake_send)
+    monkeypatch.setattr(client, "start_daemon", lambda: None)
+    monkeypatch.setattr(client, "_sleep_with_backoff", fake_backoff)
+
+    assert client.request("peek", agent_id="a1") == {"agent_id": "a1"}
+    assert len(sends) == 4
+    assert delays == [
+        daemon_client._INITIAL_RETRY_DELAY_SECONDS,
+        daemon_client._INITIAL_RETRY_DELAY_SECONDS * 2,
+    ]
+
+
 # --- daemon client: agent errors must not read as daemon failures -----------
 
 
@@ -304,13 +332,21 @@ def test_can_connect_preserves_socket_on_transient_failure(tmp_path: Path, monke
     monkeypatch.setenv("PI_AS_MCP_RUNTIME_DIR", str(tmp_path))
     sock_path = paths.socket_path()
 
-    # Stale socket (no listener): probe fails with ECONNREFUSED and unlinks.
+    # A normal probe must not unlink even a refused socket: only the startup
+    # lock holder may do that, or it can race a new listener on the same path.
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stale.bind(str(sock_path))
     stale.close()  # bound but never listening -> connect refused
     client = DaemonClient()
     assert client._can_connect() is False
-    assert not sock_path.exists(), "stale socket should be removed"
+    assert sock_path.exists()
+    assert (
+        client._socket_state(remove_stale=True)
+        is daemon_client._SocketState.ABSENT
+    )
+    assert not sock_path.exists(), (
+        "the startup coordinator should remove a stale socket"
+    )
 
     # Transient failure (timeout under load): the socket must survive.
     sock_path.touch()
@@ -321,6 +357,150 @@ def test_can_connect_preserves_socket_on_transient_failure(tmp_path: Path, monke
     monkeypatch.setattr(socket.socket, "connect", timeout_connect)
     assert client._can_connect() is False
     assert sock_path.exists(), "live daemon socket must not be unlinked on a timeout"
+
+
+def test_start_daemon_does_not_replace_a_busy_listener(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PI_AS_MCP_RUNTIME_DIR", str(tmp_path))
+    client = DaemonClient()
+    states = iter(
+        [
+            daemon_client._SocketState.BUSY,
+            daemon_client._SocketState.BUSY,
+            daemon_client._SocketState.READY,
+        ]
+    )
+    monkeypatch.setattr(client, "_socket_state", lambda **_kwargs: next(states))
+    monkeypatch.setattr(
+        client,
+        "_sleep_with_backoff",
+        lambda delay, _deadline: delay,
+    )
+    monkeypatch.setattr(
+        client,
+        "_spawn_daemon",
+        lambda: pytest.fail("must not replace a live but busy daemon"),
+    )
+
+    client.start_daemon()
+
+
+def _run_fake_coordinated_daemon(
+    runtime_path: str,
+    stop_event,
+) -> None:
+    launch_signal = Path(runtime_path) / "test-launch"
+    deadline = time.monotonic() + 5
+    while not launch_signal.exists():
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
+    path = os.path.join(runtime_path, "daemon.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(path)
+        listener.listen(128)
+        listener.settimeout(0.1)
+        while not stop_event.is_set():
+            try:
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
+            with connection:
+                connection.settimeout(0.5)
+                try:
+                    payload = connection.recv(65536)
+                except socket.timeout:
+                    continue
+                if payload:
+                    connection.sendall(b'{"models":[]}\n')
+
+
+class _ColdStartTestClient(DaemonClient):
+    """Signals a test server instead of launching the real background daemon."""
+
+    def _spawn_daemon(self) -> None:
+        runtime_path = Path(os.environ["PI_AS_MCP_RUNTIME_DIR"])
+        launch_log = runtime_path / "test-launches"
+        fd = os.open(launch_log, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+        (runtime_path / "test-launch").touch()
+
+
+def _run_cold_start_client(runtime_path: str, start_event, results) -> None:
+    os.environ["PI_AS_MCP_RUNTIME_DIR"] = runtime_path
+    if not start_event.wait(timeout=5):
+        results.put(("error", "start gate timed out"))
+        return
+    try:
+        response = _ColdStartTestClient().request("models")
+    except Exception as exc:
+        results.put(("error", repr(exc)))
+    else:
+        results.put(("ok", response))
+
+
+@pytest.mark.parametrize("with_stale_socket", [False, True])
+def test_multiprocess_cold_start_launches_once_and_all_clients_converge(
+    tmp_path: Path,
+    monkeypatch,
+    with_stale_socket: bool,
+) -> None:
+    try:
+        context = multiprocessing.get_context("spawn")
+    except ValueError:
+        pytest.skip("requires multiprocessing spawn")
+
+    monkeypatch.setenv("PI_AS_MCP_RUNTIME_DIR", str(tmp_path))
+    if with_stale_socket:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+            stale.bind(str(paths.socket_path()))
+
+    stop_event = context.Event()
+    start_event = context.Event()
+    results = context.Queue()
+
+    server_process = context.Process(
+        target=_run_fake_coordinated_daemon,
+        args=(str(tmp_path), stop_event),
+    )
+    clients = [
+        context.Process(
+            target=_run_cold_start_client,
+            args=(str(tmp_path), start_event, results),
+        )
+        for _ in range(16)
+    ]
+    server_process.start()
+    for process in clients:
+        process.start()
+    start_event.set()
+
+    try:
+        outcomes = [results.get(timeout=10) for _ in clients]
+        for process in clients:
+            process.join(timeout=5)
+        assert all(not process.is_alive() for process in clients)
+        assert outcomes == [("ok", {"models": []})] * len(clients)
+        launches = (tmp_path / "test-launches").read_text(encoding="utf-8").splitlines()
+        assert len(launches) == 1
+        lock_path = paths.daemon_start_lock_path()
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        assert daemon.UnixServer.request_queue_size >= len(clients)
+    finally:
+        stop_event.set()
+        server_process.join(timeout=5)
+        for process in clients:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        if server_process.is_alive():
+            server_process.terminate()
+            server_process.join(timeout=5)
 
 
 # --- cli: negative wait timeout must error, not wait forever ----------------
