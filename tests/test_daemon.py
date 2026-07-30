@@ -544,7 +544,7 @@ def call_daemon_handler(
         "parent_owner_pid": peer_pid,
         **request,
     }
-    return RequestHandler.handle_request(handler, request)
+    return RequestHandler._dispatch_request(handler, request)
 
 
 def test_daemon_start_does_not_hold_lock_during_spawn(tmp_path: Path) -> None:

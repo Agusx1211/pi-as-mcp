@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pi_as_mcp.compat import CHECKED_REQUEST_COMMAND, COMPAT_COMMAND, compatibility_identity
 from pi_as_mcp.config import AppConfig, ModelConcurrencyLimit, load_config
 from pi_as_mcp.pi_rpc import PiRpcError, PiRpcRunner, ToolMode, resolve_model
 from pi_as_mcp.paths import session_dir, socket_path
@@ -971,6 +972,55 @@ class RequestHandler(socketserver.StreamRequestHandler):
         if not isinstance(command, str):
             raise PiRpcError("request command must be a string")
 
+        if command == COMPAT_COMMAND:
+            return {
+                "compatible": True,
+                "daemon_pid": os.getpid(),
+                **compatibility_identity(),
+            }
+
+        if command == CHECKED_REQUEST_COMMAND:
+            expected = compatibility_identity()
+            client_protocol = request.get("protocol_version")
+            client_build = request.get("build_id")
+            if (
+                client_protocol != expected["protocol_version"]
+                or client_build != expected["build_id"]
+            ):
+                return {
+                    "compatible": False,
+                    "compatibility_error": True,
+                    "daemon_error": True,
+                    "error": (
+                        "daemon compatibility mismatch; the requested operation "
+                        "was not executed"
+                    ),
+                    "daemon_pid": os.getpid(),
+                    **expected,
+                }
+            nested = request.get("request")
+            if not isinstance(nested, dict):
+                raise PiRpcError("checked request must contain a request object")
+            nested_command = nested.get("command")
+            if nested_command in {COMPAT_COMMAND, CHECKED_REQUEST_COMMAND}:
+                raise PiRpcError("nested compatibility commands are not allowed")
+            return self._dispatch_request(nested)
+
+        # refresh-daemon.sh must be able to drain both legacy daemons and this
+        # version before replacing either one. Keep exactly this passive summary
+        # available in the old raw protocol; every normal client command must use
+        # a compatibility-checked envelope.
+        if command == "tui_summary":
+            return {"agents": STATE.global_summary(), "stats": STATE.stats_summary()}
+        raise PiRpcError(
+            "client compatibility envelope required; no operation was executed. "
+            "Restart or update the pi-as-mcp client"
+        )
+
+    def _dispatch_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        command = request.get("command")
+        if not isinstance(command, str):
+            raise PiRpcError("request command must be a string")
         peer_pid = self.peer_pid()
         parent_hint = request.get("parent_hint")
         identity = parent_identity_from_peer(
