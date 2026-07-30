@@ -1046,3 +1046,82 @@ for line in sys.stdin:
     assert "error" in data
 
     manager.close()
+
+
+def test_empty_failed_follow_up_clears_previous_final_text(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(
+        tmp_path,
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("fake-pi 1.0")
+    raise SystemExit(0)
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+turn = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("type") == "abort":
+        break
+    turn += 1
+    print(json.dumps({"id": request["id"], "type": "response", "command": "prompt", "success": True}), flush=True)
+    print(json.dumps({"type": "agent_start"}), flush=True)
+    if turn in {1, 3}:
+        answer = "first answer" if turn == 1 else "third answer"
+        message = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": answer}],
+        }
+        print(json.dumps({"type": "message_end", "message": message}), flush=True)
+        # Some providers omit the finalized messages from agent_end. A
+        # message_end from this turn must still remain the completed answer.
+        messages = [message] if turn == 1 else []
+        print(json.dumps({"type": "agent_end", "messages": messages}), flush=True)
+    else:
+        print(json.dumps({"type": "error", "error": "quota exceeded"}), flush=True)
+        print(json.dumps({"type": "agent_end", "messages": []}), flush=True)
+""",
+    )
+
+    manager = SessionManager()
+    manager._runner.pi_bin = str(fake_pi)
+
+    started = manager.start(
+        prompt="one",
+        cwd=str(tmp_path),
+        model="local/example-model",
+        provider=None,
+        tool_mode="none",
+        include_events=False,
+    )
+    first, timed_out = manager.listen(started.agent_id, after_turn_count=0, timeout_seconds=5)
+    assert timed_out is False
+    assert first.final_text == "first answer"
+
+    manager.reply(started.agent_id, prompt="two", behavior="auto")
+    second, timed_out = manager.listen(started.agent_id, after_turn_count=1, timeout_seconds=5)
+    assert timed_out is False
+    assert second.status == "idle"
+    assert second.turn_count == 2
+    assert second.final_text == ""
+    assert second.error == "quota exceeded"
+
+    response = second.to_json(verbosity="response")
+    assert response["final_text"] == ""
+    assert response["response_pending"] is False
+    assert response["error"] == "quota exceeded"
+
+    manager.reply(started.agent_id, prompt="three", behavior="auto")
+    third, timed_out = manager.listen(started.agent_id, after_turn_count=2, timeout_seconds=5)
+    assert timed_out is False
+    assert third.status == "idle"
+    assert third.turn_count == 3
+    assert third.final_text == "third answer"
+    assert third.error is None
+
+    manager.close()
