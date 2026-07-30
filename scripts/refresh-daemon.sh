@@ -77,13 +77,20 @@ if [[ "$DO_LINK" -eq 1 ]]; then
     done
 fi
 
-# Resolve the daemon's runtime dir + socket exactly as the package does.
-read -r RUNTIME_DIR SOCKET < <(
+# Resolve these separately so whitespace in a custom runtime path remains data
+# instead of being interpreted as a field separator by `read`.
+RUNTIME_DIR="$(
     "$VENV_PY" - <<'PY'
-from pi_as_mcp.paths import runtime_dir, socket_path
-print(runtime_dir(), socket_path())
+from pi_as_mcp.paths import runtime_dir
+print(runtime_dir())
 PY
-)
+)"
+SOCKET="$(
+    "$VENV_PY" - <<'PY'
+from pi_as_mcp.paths import socket_path
+print(socket_path())
+PY
+)"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -133,64 +140,7 @@ PY
 
 # Print the PID(s) of the daemon serving our runtime dir (space separated).
 find_daemon_pids() {
-    "$VENV_PY" - "$RUNTIME_DIR" <<'PY'
-import os, sys
-from pathlib import Path
-
-target = Path(sys.argv[1]).resolve()
-
-
-def runtime_dir_of(pid: str) -> Path | None:
-    try:
-        raw = Path(f"/proc/{pid}/environ").read_bytes()
-    except OSError:
-        raw = b""
-    env = {}
-    for kv in raw.split(b"\0"):
-        if b"=" in kv:
-            key, value = kv.split(b"=", 1)
-            env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
-    override = env.get("PI_AS_MCP_RUNTIME_DIR")
-    if override:
-        return Path(override).expanduser()
-    try:
-        uid = os.stat(f"/proc/{pid}").st_uid
-    except OSError:
-        return None
-    return Path(f"/tmp/pi-as-mcp-{uid}")
-
-
-def is_daemon(argv: list[str]) -> bool:
-    # Match an actual worker process, not anything that merely mentions the
-    # module name (this script, pgrep, an editor). Require either
-    # `<python> ... pi_as_mcp.daemon` (the auto-started form) or the
-    # pi-agent-daemon console script, with pi_as_mcp.daemon as a whole argv
-    # element rather than a substring of some larger argument.
-    if not argv:
-        return False
-    base = os.path.basename(argv[0])
-    if "python" in base and "pi_as_mcp.daemon" in argv[1:]:
-        return True
-    return base == "pi-agent-daemon"
-
-
-pids = []
-for pid in os.listdir("/proc"):
-    if not pid.isdigit() or pid == str(os.getpid()):
-        continue
-    try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        continue
-    argv = [part.decode("utf-8", "replace") for part in cmdline.split(b"\0") if part]
-    if not is_daemon(argv):
-        continue
-    rt = runtime_dir_of(pid)
-    if rt is not None and rt.resolve() == target:
-        pids.append(pid)
-
-print(" ".join(pids))
-PY
+    "$VENV_PY" -m pi_as_mcp.daemon_discovery "$RUNTIME_DIR" "$SOCKET"
 }
 
 # ---------------------------------------------------------------------------
@@ -244,7 +194,7 @@ else
         kill -TERM "$pid" 2>/dev/null || true
     done
     for pid in $PIDS; do
-        for _ in $(seq 1 20); do
+        for ((attempt = 0; attempt < 20; attempt++)); do
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.5
         done
