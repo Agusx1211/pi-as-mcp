@@ -198,6 +198,26 @@ By default, every local client for the same Unix user uses the same daemon
 socket under `/tmp/pi-as-mcp-$UID`. Set `PI_AS_MCP_RUNTIME_DIR` only if you
 deliberately want a separate daemon namespace.
 
+### Updating a shared daemon
+
+Clients verify the daemon protocol and installed code before sending an
+operation. This prevents a CLI or MCP server from silently using an older
+daemon started by another checkout. A mismatch leaves the existing daemon and
+its agents untouched and reports that no operation was executed.
+
+After pulling changes or switching the installation that should own the shared
+daemon, refresh it from that checkout:
+
+```bash
+scripts/refresh-daemon.sh
+```
+
+The script updates the local environment, waits for active turns to finish,
+then restarts the daemon on the current code. Use `--max-wait SECONDS` to abort
+if draining takes too long. `--force` interrupts active work and should only be
+used intentionally. `PI_AS_MCP_RUNTIME_DIR` selects which isolated daemon is
+refreshed.
+
 ### Async Semantics
 
 MCP clients such as Codex and Claude Code generally do not resume the parent

@@ -18,6 +18,11 @@ from pathlib import Path
 import pytest
 
 from pi_as_mcp import cli, daemon, daemon_client, paths, server, sessions
+from pi_as_mcp.compat import (
+    CHECKED_REQUEST_COMMAND,
+    COMPAT_COMMAND,
+    compatibility_identity,
+)
 from pi_as_mcp.config import parse_app_config
 from pi_as_mcp.config_tui import ConfigDraft
 from pi_as_mcp.daemon_client import DaemonClient, DaemonClientError
@@ -260,6 +265,7 @@ def test_client_does_not_resend_after_post_connect_failure(monkeypatch) -> None:
     # A recv timeout (socket.timeout is an OSError) used to trigger
     # start_daemon() plus a blind re-send, duplicating delegate/reply commands.
     client = DaemonClient()
+    client._compatible_socket = (1, 1)
     sends: list = []
 
     def fake_send(payload, timeout):
@@ -267,15 +273,18 @@ def test_client_does_not_resend_after_post_connect_failure(monkeypatch) -> None:
         raise socket.timeout("timed out")
 
     monkeypatch.setattr(client, "_send", fake_send)
+    monkeypatch.setattr(client, "_socket_identity", lambda: (1, 1))
     monkeypatch.setattr(client, "start_daemon", lambda: pytest.fail("must not spawn a daemon"))
 
     with pytest.raises(DaemonClientError):
         client.request("delegate", prompt="x")
     assert len(sends) == 1
+    assert sends[0]["request"]["command"] == "delegate"
 
 
 def test_client_retries_once_on_connect_failure(monkeypatch) -> None:
     client = DaemonClient()
+    client._compatible_socket = (1, 1)
     sends: list = []
     daemon_starts: list = []
 
@@ -283,24 +292,40 @@ def test_client_retries_once_on_connect_failure(monkeypatch) -> None:
         sends.append(payload)
         if len(sends) == 1:
             raise daemon_client._DaemonConnectError("connection refused")
+        if payload["command"] == "__compat__":
+            return [json.dumps(compatibility_identity()).encode("utf-8")]
         return [json.dumps({"agent_id": "a1"}).encode("utf-8")]
 
     monkeypatch.setattr(client, "_send", fake_send)
+    monkeypatch.setattr(client, "_socket_identity", lambda: (1, 1))
     monkeypatch.setattr(client, "start_daemon", lambda: daemon_starts.append(True))
 
     assert client.request("peek", agent_id="a1") == {"agent_id": "a1"}
-    assert len(sends) == 2
+    assert [payload["command"] for payload in sends] == [
+        "__checked_request__",
+        "__compat__",
+        "__checked_request__",
+    ]
+    assert sum(
+        payload.get("request", {}).get("command") == "peek" for payload in sends
+    ) == 2
     assert daemon_starts == [True]
 
 
 def test_client_retries_repeated_connect_failures_with_backoff(monkeypatch) -> None:
     client = DaemonClient()
+    client._compatible_socket = (1, 1)
     sends: list = []
     delays: list[float] = []
+    checked_attempts = 0
 
     def fake_send(payload, timeout):
+        nonlocal checked_attempts
         sends.append(payload)
-        if len(sends) < 4:
+        if payload["command"] == COMPAT_COMMAND:
+            return [json.dumps(compatibility_identity()).encode("utf-8")]
+        checked_attempts += 1
+        if checked_attempts < 4:
             raise daemon_client._DaemonConnectError("accept queue busy")
         return [json.dumps({"agent_id": "a1"}).encode("utf-8")]
 
@@ -309,11 +334,18 @@ def test_client_retries_repeated_connect_failures_with_backoff(monkeypatch) -> N
         return delay * 2
 
     monkeypatch.setattr(client, "_send", fake_send)
+    monkeypatch.setattr(client, "_socket_identity", lambda: (1, 1))
     monkeypatch.setattr(client, "start_daemon", lambda: None)
     monkeypatch.setattr(client, "_sleep_with_backoff", fake_backoff)
 
     assert client.request("peek", agent_id="a1") == {"agent_id": "a1"}
-    assert len(sends) == 4
+    assert [payload["command"] for payload in sends] == [
+        CHECKED_REQUEST_COMMAND,
+        COMPAT_COMMAND,
+        CHECKED_REQUEST_COMMAND,
+        CHECKED_REQUEST_COMMAND,
+        CHECKED_REQUEST_COMMAND,
+    ]
     assert delays == [
         daemon_client._INITIAL_RETRY_DELAY_SECONDS,
         daemon_client._INITIAL_RETRY_DELAY_SECONDS * 2,
@@ -328,7 +360,9 @@ def test_client_passes_through_snapshot_with_agent_error(monkeypatch) -> None:
     # field; the client used to raise on it, making errored agents impossible
     # to peek/listen/stop.
     client = DaemonClient()
+    client._compatible_socket = (1, 1)
     snapshot = {"agent_id": "a1", "status": "error", "error": "rate limited"}
+    monkeypatch.setattr(client, "_socket_identity", lambda: (1, 1))
     monkeypatch.setattr(
         client, "_send", lambda payload, timeout: [json.dumps(snapshot).encode("utf-8")]
     )
@@ -337,6 +371,8 @@ def test_client_passes_through_snapshot_with_agent_error(monkeypatch) -> None:
 
 def test_client_raises_on_daemon_error_envelopes(monkeypatch) -> None:
     client = DaemonClient()
+    client._compatible_socket = (1, 1)
+    monkeypatch.setattr(client, "_socket_identity", lambda: (1, 1))
     for envelope in (
         {"error": "unknown agent_id: a1", "daemon_error": True},
         {"error": "legacy failure"},  # old daemons: bare single-key envelope
@@ -437,7 +473,17 @@ def _run_fake_coordinated_daemon(
                 except socket.timeout:
                     continue
                 if payload:
-                    connection.sendall(b'{"models":[]}\n')
+                    request = json.loads(payload.decode("utf-8"))
+                    if request["command"] == COMPAT_COMMAND:
+                        response = {"compatible": True, **compatibility_identity()}
+                    elif request["command"] == CHECKED_REQUEST_COMMAND:
+                        response = {"models": []}
+                    else:
+                        response = {
+                            "error": f"unknown command: {request['command']}",
+                            "daemon_error": True,
+                        }
+                    connection.sendall((json.dumps(response) + "\n").encode("utf-8"))
 
 
 class _ColdStartTestClient(DaemonClient):
