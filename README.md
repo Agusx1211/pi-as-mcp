@@ -117,7 +117,9 @@ Tool modes:
 | `full` | `read,grep,find,ls,edit,write,bash` |
 
 A running turn is bounded by inactivity, not wall-clock. A turn that produces
-no activity for 600 seconds is aborted as stalled (`status: timeout`).
+no activity for 60 minutes is aborted as stalled (`status: timeout`). Set
+`PI_AS_MCP_INACTIVITY_TIMEOUT_SECONDS` to a positive number of seconds to
+override that default.
 
 ### `agent_reply`
 

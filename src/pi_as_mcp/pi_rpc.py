@@ -15,7 +15,6 @@ ToolMode = Literal["none", "read-only", "write", "full"]
 
 DEFAULT_PI_BIN = "pi"
 DEFAULT_PI_AGENT_DIR = "~/.pi/agent"
-DEFAULT_TURN_TIMEOUT_SECONDS = 600
 DEFAULT_MODEL_VALIDATION_TIMEOUT_SECONDS = 15
 # How long a successful model validation stays cached before we re-spawn
 # `pi --list-models`. Spawning pi costs ~0.75s of node startup, and it sits on
