@@ -1119,7 +1119,7 @@ for line in sys.stdin:
     # lightweight accessor stays byte-for-byte identical to the full snapshot.
     def assert_consistent() -> None:
         with session._lock:
-            status, model, provider = session._status_info_locked()
+            status, model, provider = session.status_info()
             snapshot = session._snapshot_locked(include_events=False)
         assert status == snapshot.status
         assert model == snapshot.model
@@ -1156,18 +1156,18 @@ for line in sys.stdin:
         session._closed = False
         session._status = "idle"
 
-    # active_model_count counts only starting/running sessions.
-    assert manager.active_model_count(
+    # active_model_agent_ids includes only starting/running sessions.
+    assert manager.active_model_agent_ids(
         provider="local", model="example-model", match_provider=False
-    ) == 0
+    ) == set()
     with session._lock:
         session._running = True
-    assert manager.active_model_count(
+    assert manager.active_model_agent_ids(
         provider="local", model="example-model", match_provider=False
-    ) == 1
-    assert manager.active_model_count(
+    ) == {started.agent_id}
+    assert manager.active_model_agent_ids(
         provider="local", model="other-model", match_provider=False
-    ) == 0
+    ) == set()
     with session._lock:
         session._running = False
 

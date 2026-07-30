@@ -418,7 +418,9 @@ def test_daemon_reloads_session_policy_for_existing_manager(
         write_session_policy_config(
             config,
             persist_sessions=False,
-            idle_eviction_seconds=0,
+            # The stored threshold is irrelevant while persistence is disabled;
+            # live policy normalizes it to zero.
+            idle_eviction_seconds=120,
         )
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:

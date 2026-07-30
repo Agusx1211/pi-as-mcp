@@ -469,9 +469,14 @@ class DaemonState:
         config: AppConfig,
     ) -> tuple[Path | None, float]:
         agents_config = config.agents
+        configured_session_dir = (
+            session_dir() if agents_config.persist_sessions else None
+        )
         return (
-            session_dir() if agents_config.persist_sessions else None,
-            agents_config.idle_eviction_seconds,
+            configured_session_dir,
+            agents_config.idle_eviction_seconds
+            if configured_session_dir is not None
+            else 0,
         )
 
     def _manager_for_locked(
@@ -556,7 +561,7 @@ class DaemonState:
             )
         finally:
             # The session (if started) is now registered with its manager and
-            # counted by active_model_count, so the reservation can drop. On
+            # counted among active model agents, so the reservation can drop. On
             # failure this still frees the slot we held.
             with self._lock:
                 self._release_start_locked(model_spec.provider, model_spec.model)

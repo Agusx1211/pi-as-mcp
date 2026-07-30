@@ -92,7 +92,6 @@ class _WatchdogAction:
 
     kind: Literal["stall", "evict"]
     process: subprocess.Popen[str]
-    process_generation: int
     last_activity_monotonic: float
     threshold_seconds: float
 
@@ -693,9 +692,6 @@ class PiAgentSession:
         # per token. Only ever touched by the stdout reader thread.
         self._stream_buffer = ""
         self.process: subprocess.Popen[str] | None = None
-        # Incremented for every worker spawn so a delayed watchdog decision can
-        # never be applied to a replacement process.
-        self._process_generation = 0
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
 
@@ -719,10 +715,9 @@ class PiAgentSession:
     def _persist_enabled(self) -> bool:
         return self.session_dir is not None
 
-    def _apply_session_policy(
+    def _apply_idle_eviction_policy(
         self,
         *,
-        persist_sessions: bool,
         idle_eviction_seconds: float,
     ) -> None:
         """Apply live config without making an existing session unsafe.
@@ -740,9 +735,7 @@ class PiAgentSession:
                 # of a worker launched with --no-session.
                 self.idle_eviction_seconds = 0
             else:
-                self.idle_eviction_seconds = (
-                    idle_eviction_seconds if persist_sessions else 0
-                )
+                self.idle_eviction_seconds = idle_eviction_seconds
 
     def _start_worker_locked(self) -> None:
         """Spawn (or respawn) the Pi RPC subprocess and start its IO readers.
@@ -791,7 +784,6 @@ class PiAgentSession:
             start_new_session=os.name == "posix",
         )
         self.process = process
-        self._process_generation += 1
         self._evicted = False
         self._responses.clear()
         self._stdout_thread = threading.Thread(target=self._read_stdout, args=(process,), daemon=True)
@@ -1205,23 +1197,14 @@ class PiAgentSession:
             status = "idle"
         return status
 
-    def _status_info_locked(self) -> tuple[str, str, str]:
-        """Return ``(status, model, provider)`` without copying any lists.
-
-        Cheap accessor for hot paths (e.g. the concurrency check) that only
-        need the derived status and model/provider identity rather than a full
-        ``SessionSnapshot``.
-        """
-        return (
-            self._derive_status_locked(),
-            self.model_spec.model,
-            self.model_spec.provider,
-        )
-
     def status_info(self) -> tuple[str, str, str]:
-        """Locked public accessor for ``(status, model, provider)``."""
+        """Return ``(status, model, provider)`` without building a snapshot."""
         with self._lock:
-            return self._status_info_locked()
+            return (
+                self._derive_status_locked(),
+                self.model_spec.model,
+                self.model_spec.provider,
+            )
 
     def _snapshot_locked(self, *, include_events: bool | None = None) -> SessionSnapshot:
         status = self._derive_status_locked()
@@ -1492,7 +1475,6 @@ class PiAgentSession:
         return _WatchdogAction(
             kind=kind,
             process=process,
-            process_generation=self._process_generation,
             last_activity_monotonic=self.last_activity_monotonic,
             threshold_seconds=threshold_seconds,
         )
@@ -1501,8 +1483,6 @@ class PiAgentSession:
         process = self.process
         return (
             process is action.process
-            and self._process_generation == action.process_generation
-            and process is not None
             and process.poll() is None
         )
 
@@ -1708,7 +1688,9 @@ class SessionManager:
         self._observer = observer
         self._transcript_sink = transcript_sink
         self._session_dir = session_dir
-        self._idle_eviction_seconds = idle_eviction_seconds
+        self._idle_eviction_seconds = (
+            idle_eviction_seconds if session_dir is not None else 0
+        )
 
     def apply_session_policy(
         self,
@@ -1717,21 +1699,19 @@ class SessionManager:
         idle_eviction_seconds: float,
     ) -> None:
         """Update defaults and safely apply live policy to existing agents."""
-        persist_sessions = session_dir is not None
+        idle_eviction_seconds = (
+            idle_eviction_seconds if session_dir is not None else 0
+        )
         with self._lock:
             self._session_dir = session_dir
             self._idle_eviction_seconds = idle_eviction_seconds
             for session in self._sessions.values():
-                session._apply_session_policy(
-                    persist_sessions=persist_sessions,
+                session._apply_idle_eviction_policy(
                     idle_eviction_seconds=idle_eviction_seconds,
                 )
 
     def _current_session_policy_locked(self) -> tuple[Path | None, float]:
-        idle_eviction_seconds = (
-            self._idle_eviction_seconds if self._session_dir is not None else 0
-        )
-        return self._session_dir, idle_eviction_seconds
+        return self._session_dir, self._idle_eviction_seconds
 
     def start(
         self,
@@ -1769,9 +1749,8 @@ class SessionManager:
                 # session before publishing it so starts are atomic with respect
                 # to the manager's latest policy. The session itself preserves
                 # its launch-time persistence capability where necessary.
-                current_dir, current_idle = self._current_session_policy_locked()
-                session._apply_session_policy(
-                    persist_sessions=current_dir is not None,
+                _, current_idle = self._current_session_policy_locked()
+                session._apply_idle_eviction_policy(
                     idle_eviction_seconds=current_idle,
                 )
                 self._sessions[agent_id] = session
@@ -1805,11 +1784,10 @@ class SessionManager:
             session = self._sessions.get(agent_id)
             if session is None:
                 raise PiRpcError(f"unknown agent_id: {agent_id}")
-            session_dir, idle_eviction_seconds = self._current_session_policy_locked()
+            _, idle_eviction_seconds = self._current_session_policy_locked()
             # An evicted worker must see the latest policy before send() decides
             # whether and how to resume it.
-            session._apply_session_policy(
-                persist_sessions=session_dir is not None,
+            session._apply_idle_eviction_policy(
                 idle_eviction_seconds=idle_eviction_seconds,
             )
         ack = session.send(prompt, behavior=behavior)
@@ -1846,15 +1824,6 @@ class SessionManager:
         with self._lock:
             sessions = list(self._sessions.values())
         return [session.summary().to_json() for session in sessions]
-
-    def active_model_count(self, *, provider: str, model: str, match_provider: bool) -> int:
-        return len(
-            self.active_model_agent_ids(
-                provider=provider,
-                model=model,
-                match_provider=match_provider,
-            )
-        )
 
     def active_model_agent_ids(
         self,
