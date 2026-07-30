@@ -16,6 +16,7 @@ import pytest
 from pi_as_mcp.daemon import (
     DaemonState,
     ParentIdentity,
+    RequestHandler,
     agent_spawn_rank,
     exposed_model_aliases,
     parent_identity_from_peer,
@@ -448,6 +449,23 @@ while True:
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def call_daemon_handler(
+    state: DaemonState,
+    request: dict[str, object],
+    monkeypatch,
+) -> dict[str, object]:
+    peer_pid = os.getpid()
+    monkeypatch.setattr("pi_as_mcp.daemon.STATE", state)
+    handler = Mock()
+    handler.peer_pid.return_value = peer_pid
+    request = {
+        "parent_hint": "mcp:telemetry-test",
+        "parent_owner_pid": peer_pid,
+        **request,
+    }
+    return RequestHandler.handle_request(handler, request)
 
 
 def test_daemon_start_does_not_hold_lock_during_spawn(tmp_path: Path) -> None:
@@ -1010,6 +1028,134 @@ def test_daemon_records_start_stats(tmp_path: Path, monkeypatch) -> None:
         state.close()
 
 
+def test_start_succeeds_when_post_start_stats_write_fails(tmp_path: Path, monkeypatch) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+    state = DaemonState()
+    identity = parent_identity_from_peer(
+        os.getpid(),
+        parent_hint="mcp:telemetry-test",
+        parent_owner_pid=os.getpid(),
+    )
+    try:
+        manager = state.manager_for(identity)
+        manager._runner.pi_bin = str(fake_pi)
+
+        def fail_snapshot(*args, **kwargs) -> None:
+            raise OSError("stats directory is read-only")
+
+        monkeypatch.setattr(state._stats, "record_agent_snapshot", fail_snapshot)
+        started = call_daemon_handler(
+            state,
+            {
+                "command": "start",
+                "prompt": "start exactly once",
+                "cwd": str(tmp_path),
+                "model": "local/example-model",
+                "tool_mode": "none",
+            },
+            monkeypatch,
+        )
+
+        agents = manager.summary()
+        assert len(agents) == 1
+        assert agents[0]["agent_id"] == started["agent_id"]
+        assert started["telemetry_warning"]["latest"]["operation"] == "agent snapshot (agent_started)"
+        health = state.stats_summary()["telemetry"]
+        assert health["healthy"] is False
+        assert health["failure_count"] == 1
+    finally:
+        state.close()
+
+
+def test_reply_succeeds_when_post_reply_stats_write_fails(tmp_path: Path, monkeypatch) -> None:
+    fake_pi = write_replyable_fake_pi(tmp_path)
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+    state = DaemonState()
+    identity = parent_identity_from_peer(
+        os.getpid(),
+        parent_hint="mcp:telemetry-test",
+        parent_owner_pid=os.getpid(),
+    )
+    try:
+        manager = state.manager_for(identity)
+        manager._runner.pi_bin = str(fake_pi)
+        started = state.start(
+            identity,
+            prompt="idle first",
+            cwd=str(tmp_path),
+            model="local/example-model",
+            provider=None,
+            tool_mode="none",
+            include_events=False,
+        )
+        agent_id = str(started["agent_id"])
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if manager.peek(agent_id, include_events=False).status == "idle":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("agent did not become idle")
+
+        def fail_snapshot(*args, **kwargs) -> None:
+            raise OSError("stats directory is read-only")
+
+        monkeypatch.setattr(state._stats, "record_agent_snapshot", fail_snapshot)
+        replied = call_daemon_handler(
+            state,
+            {
+                "command": "reply",
+                "agent_id": agent_id,
+                "prompt": "run",
+                "behavior": "auto",
+            },
+            monkeypatch,
+        )
+
+        assert replied["agent_id"] == agent_id
+        assert replied["reply_was_running"] is False
+        assert len(manager.summary()) == 1
+        assert len(manager.peek(agent_id, include_events=False).prompts) == 2
+        assert replied["telemetry_warning"]["latest"]["operation"] == "agent snapshot (agent_updated)"
+        assert state.stats_summary()["telemetry"]["failure_count"] >= 1
+    finally:
+        state.close()
+
+
+def test_transcript_failure_is_visible_without_stopping_agent(tmp_path: Path, monkeypatch) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="transcript-failure", owner_pid=None, label="test")
+    try:
+        manager = state.manager_for(identity)
+        manager._runner.pi_bin = str(fake_pi)
+
+        def fail_transcript(*args, **kwargs) -> None:
+            raise OSError("transcript directory is read-only")
+
+        monkeypatch.setattr(state._stats, "append_transcript", fail_transcript)
+        started = state.start(
+            identity,
+            prompt="keep working",
+            cwd=str(tmp_path),
+            model="local/example-model",
+            provider=None,
+            tool_mode="none",
+            include_events=False,
+        )
+
+        assert len(manager.summary()) == 1
+        assert started["telemetry_warning"]["latest"]["operation"] == "transcript append"
+        health = state.stats_summary()["telemetry"]
+        assert health["healthy"] is False
+        assert health["warnings"][0]["error"].endswith("transcript directory is read-only")
+    finally:
+        state.close()
+
+
 def test_daemon_records_completed_stats_before_parent_observes_output(tmp_path: Path, monkeypatch) -> None:
     fake_pi = write_finishing_fake_pi(tmp_path)
     monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
@@ -1100,5 +1246,27 @@ def test_daemon_score_records_when_enabled(tmp_path: Path, monkeypatch) -> None:
         assert scored["sentiment"] == "net-negative"
         assert state.agent_stats("agent-1")["latest_score"]["score"] == 3
         assert state.score_hint("agent-1") is None
+    finally:
+        state.close()
+
+
+def test_daemon_score_write_failure_is_not_reported_as_recorded(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(write_score_config(tmp_path, enabled=True)))
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="score-failure", owner_pid=None, label="scorer")
+    try:
+        def fail_score(*args, **kwargs) -> None:
+            raise OSError("score audit is read-only")
+
+        monkeypatch.setattr(state._stats, "record_score", fail_score)
+        with pytest.raises(OSError, match="score audit is read-only"):
+            state.score_agent(
+                identity,
+                agent_id="agent-1",
+                score=8,
+                category="review",
+                comment="good result",
+            )
     finally:
         state.close()

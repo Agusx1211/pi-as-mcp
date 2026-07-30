@@ -386,6 +386,11 @@ prompts, usage, tool counts, scores, and observation status. Each agent also
 gets a full transcript at `transcripts/<agent_id>.jsonl`, written live as the
 worker runs.
 
+Stats and transcript writes are best-effort and never fail an agent action that
+was already accepted. If persistence fails, agent responses include a
+`telemetry_warning`; `pi-agent summary` and the dashboard show the daemon's
+bounded telemetry error state.
+
 ## Development
 
 ```bash

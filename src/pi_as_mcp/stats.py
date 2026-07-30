@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import threading
 import time
@@ -14,6 +15,10 @@ AGENT_EVENTS_FILE = "agent-events.jsonl"
 SCORES_FILE = "scores.jsonl"
 TRANSCRIPTS_DIR = "transcripts"
 FINISHED_STATUSES = {"idle", "stopped", "timeout", "error", "exited"}
+MAX_TELEMETRY_WARNINGS = 5
+TELEMETRY_ERROR_TEXT_LIMIT = 240
+
+logger = logging.getLogger(__name__)
 
 
 def stats_dir() -> Path:
@@ -47,6 +52,9 @@ class StatsStore:
         self._observed_count = 0
         self._score_count = 0
         self._score_total = 0
+        self._telemetry_failure_count = 0
+        self._telemetry_log_warnings = 0
+        self._telemetry_warnings: dict[tuple[str, str], dict[str, Any]] = {}
         self._seed_from_disk()
 
     def _seed_from_disk(self) -> None:
@@ -228,7 +236,55 @@ class StatsStore:
             "unobserved_agents": max(total_agents - observed_count, 0),
             "scores": score_count,
             "average_score": round(score_total / score_count, 2) if score_count else None,
+            "telemetry": self.telemetry_health(),
         }
+
+    def note_persistence_failure(self, operation: str, exc: Exception) -> None:
+        """Record a best-effort telemetry failure without touching the stats files.
+
+        Lifecycle callers use this after an agent action has already succeeded.
+        The bounded in-memory warning state remains inspectable even when the
+        stats directory itself is unavailable.
+        """
+        operation = compact_text(operation, limit=80) or "unknown"
+        error = compact_text(f"{type(exc).__name__}: {exc}", limit=TELEMETRY_ERROR_TEXT_LIMIT)
+        timestamp, iso = now_event_time()
+        key = (operation, error)
+        should_log = False
+
+        with self._lock:
+            self._telemetry_failure_count += 1
+            warning = self._telemetry_warnings.get(key)
+            if warning is None:
+                warning = {
+                    "operation": operation,
+                    "error": error,
+                    "count": 0,
+                    "first_at": timestamp,
+                    "first_time": iso,
+                }
+                self._telemetry_warnings[key] = warning
+                if len(self._telemetry_warnings) > MAX_TELEMETRY_WARNINGS:
+                    oldest = next(iter(self._telemetry_warnings))
+                    self._telemetry_warnings.pop(oldest)
+                if self._telemetry_log_warnings < MAX_TELEMETRY_WARNINGS:
+                    self._telemetry_log_warnings += 1
+                    should_log = True
+            warning["count"] = int(warning["count"]) + 1
+            warning["last_at"] = timestamp
+            warning["last_time"] = iso
+
+        if should_log:
+            logger.warning("telemetry persistence failed during %s: %s", operation, error)
+
+    def telemetry_health(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "healthy": self._telemetry_failure_count == 0,
+                "failure_count": self._telemetry_failure_count,
+                "log_warnings_emitted": self._telemetry_log_warnings,
+                "warnings": copy.deepcopy(list(self._telemetry_warnings.values())),
+            }
 
     def _append_jsonl(self, path: Path, event: dict[str, Any]) -> None:
         with self._lock:

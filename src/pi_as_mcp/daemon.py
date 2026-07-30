@@ -371,7 +371,7 @@ class DaemonState:
                     snapshot=snapshot.to_json(verbosity="normal"),
                     identity=identity,
                 ),
-                transcript_sink=self._stats.append_transcript,
+                transcript_sink=self._append_transcript,
                 session_dir=configured_session_dir,
                 idle_eviction_seconds=idle_eviction_seconds,
             )
@@ -447,7 +447,9 @@ class DaemonState:
             snapshot=data,
             identity=identity,
         )
-        return snapshot.to_json(verbosity="summary")
+        response = snapshot.to_json(verbosity="summary")
+        self.attach_telemetry_warning(response)
+        return response
 
     def reply(
         self,
@@ -517,12 +519,15 @@ class DaemonState:
         agent_id = str(snapshot.get("agent_id") or "")
         if not agent_id:
             return
-        self._stats.record_observed(
-            agent_id=agent_id,
-            via=via,
-            snapshot=snapshot,
-            requester=requester_info(identity),
-        )
+        try:
+            self._stats.record_observed(
+                agent_id=agent_id,
+                via=via,
+                snapshot=snapshot,
+                requester=requester_info(identity),
+            )
+        except Exception as exc:
+            self._stats.note_persistence_failure(f"agent observation ({via})", exc)
 
     def agent_stats(self, agent_id: str) -> dict[str, Any]:
         return self._stats.agent_stats(agent_id)
@@ -584,6 +589,21 @@ class DaemonState:
 
     def stats_summary(self) -> dict[str, Any]:
         return self._stats.summary()
+
+    def attach_telemetry_warning(self, data: dict[str, Any]) -> None:
+        health = self._stats.telemetry_health()
+        if health["healthy"]:
+            return
+        warnings = health["warnings"]
+        latest = max(warnings, key=lambda item: float(item.get("last_at") or 0.0))
+        data["telemetry_warning"] = {
+            "message": (
+                "Agent action succeeded, but telemetry persistence failed; "
+                "stored stats or transcripts may be incomplete."
+            ),
+            "failure_count": health["failure_count"],
+            "latest": latest,
+        }
 
     def _enforce_concurrency_limits_locked(
         self,
@@ -662,11 +682,20 @@ class DaemonState:
         snapshot: dict[str, Any],
         identity: ParentIdentity,
     ) -> None:
-        self._stats.record_agent_snapshot(
-            event_type=event_type,
-            snapshot=snapshot,
-            requester=requester_info(identity),
-        )
+        try:
+            self._stats.record_agent_snapshot(
+                event_type=event_type,
+                snapshot=snapshot,
+                requester=requester_info(identity),
+            )
+        except Exception as exc:
+            self._stats.note_persistence_failure(f"agent snapshot ({event_type})", exc)
+
+    def _append_transcript(self, agent_id: str, record: dict[str, Any]) -> None:
+        try:
+            self._stats.append_transcript(agent_id, record)
+        except Exception as exc:
+            self._stats.note_persistence_failure("transcript append", exc)
 
     def manager_for_agent(self, agent_id: str) -> SessionManager | None:
         match = self.manager_identity_for_agent(agent_id)
@@ -877,6 +906,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
             data["reply_after_turn_count"] = int(ack.get("turn_count_before") or 0)
             data["reply_was_running"] = bool(ack.get("was_running"))
             STATE.record_agent_snapshot(event_type="agent_updated", snapshot=data, identity=target_identity)
+            STATE.attach_telemetry_warning(data)
             return data
 
         if command == "peek":
@@ -1030,11 +1060,16 @@ def attach_agent_stats(data: dict[str, Any]) -> None:
     agent_id = str(data.get("agent_id") or "")
     if agent_id:
         data["stats"] = STATE.agent_stats(agent_id)
+    STATE.attach_telemetry_warning(data)
 
 
 class UnixServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver's default is five. A cold fan-out of MCP parents can fill
+    # that queue before handler threads begin accepting, producing EAGAIN even
+    # though the daemon is healthy.
+    request_queue_size = 128
 
 
 def serve() -> None:
