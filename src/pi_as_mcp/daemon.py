@@ -334,29 +334,64 @@ class DaemonState:
         self._pending_replies: dict[tuple[str, str], _ReplyReservation] = {}
         self._stats = StatsStore()
         self._closed = False
+        self._session_policy_signature: tuple[Path | None, float] | None = None
         self._reaper = threading.Thread(target=self._reap_closed_parents, daemon=True)
         self._reaper.start()
 
     def manager_for(self, identity: ParentIdentity) -> SessionManager:
+        config = load_config()
+        session_policy = self._configured_session_policy(config)
         with self._lock:
-            manager = self._managers.get(identity.scope_id)
-            if manager is None:
-                agents_config = load_config().agents
-                manager = SessionManager(
-                    parent_id=identity.scope_id,
-                    owner_pid=identity.owner_pid,
-                    observer=lambda event_type, snapshot, identity=identity: self._record_agent_snapshot(
-                        event_type=event_type,
-                        snapshot=snapshot.to_json(verbosity="normal"),
-                        identity=identity,
-                    ),
-                    transcript_sink=self._append_transcript,
-                    session_dir=session_dir() if agents_config.persist_sessions else None,
-                    idle_eviction_seconds=agents_config.idle_eviction_seconds,
-                )
-                self._managers[identity.scope_id] = manager
-                self._identities[identity.scope_id] = identity
-            return manager
+            return self._manager_for_locked(identity, session_policy)
+
+    @staticmethod
+    def _configured_session_policy(
+        config: AppConfig,
+    ) -> tuple[Path | None, float]:
+        agents_config = config.agents
+        return (
+            session_dir() if agents_config.persist_sessions else None,
+            agents_config.idle_eviction_seconds,
+        )
+
+    def _manager_for_locked(
+        self,
+        identity: ParentIdentity,
+        session_policy: tuple[Path | None, float],
+    ) -> SessionManager:
+        self._apply_session_policy_locked(session_policy)
+        configured_session_dir, idle_eviction_seconds = session_policy
+        manager = self._managers.get(identity.scope_id)
+        if manager is None:
+            manager = SessionManager(
+                parent_id=identity.scope_id,
+                owner_pid=identity.owner_pid,
+                observer=lambda event_type, snapshot, identity=identity: self._record_agent_snapshot(
+                    event_type=event_type,
+                    snapshot=snapshot.to_json(verbosity="normal"),
+                    identity=identity,
+                ),
+                transcript_sink=self._append_transcript,
+                session_dir=configured_session_dir,
+                idle_eviction_seconds=idle_eviction_seconds,
+            )
+            self._managers[identity.scope_id] = manager
+            self._identities[identity.scope_id] = identity
+        return manager
+
+    def _apply_session_policy_locked(
+        self,
+        session_policy: tuple[Path | None, float],
+    ) -> None:
+        if session_policy == self._session_policy_signature:
+            return
+        configured_session_dir, idle_eviction_seconds = session_policy
+        for manager in self._managers.values():
+            manager.apply_session_policy(
+                session_dir=configured_session_dir,
+                idle_eviction_seconds=idle_eviction_seconds,
+            )
+        self._session_policy_signature = session_policy
 
     def start(
         self,
@@ -371,11 +406,12 @@ class DaemonState:
     ) -> dict[str, Any]:
         model_spec = resolve_model(model, provider)
         config = load_config()
+        session_policy = self._configured_session_policy(config)
         # Hold the lock only long enough to atomically resolve the manager and
         # reserve a concurrency slot; release it before the expensive worker spawn
         # so peeks/listens/other delegates aren't serialized behind this start.
         with self._lock:
-            manager = self.manager_for(identity)
+            manager = self._manager_for_locked(identity, session_policy)
             if config.agents.is_model_disabled(provider=model_spec.provider, model=model_spec.model):
                 raise PiRpcError(
                     f"model {model_spec.provider}/{model_spec.model} is disabled in pi-as-mcp config; "
@@ -426,16 +462,23 @@ class DaemonState:
         # Find the agent and reserve its model slot as one atomic daemon action.
         # The reservation also bridges a running turn that finishes while its
         # follow-up prompt is waiting for Pi's acknowledgement.
+        config = load_config()
+        session_policy = self._configured_session_policy(config)
         with self._lock:
+            self._apply_session_policy_locked(session_policy)
             match = self.manager_identity_for_agent(agent_id)
-            manager, target_identity = match if match else (self.manager_for(identity), identity)
+            if match:
+                manager, target_identity = match
+            else:
+                manager = self._manager_for_locked(identity, session_policy)
+                target_identity = identity
             status, model, provider = manager.agent_status_info(agent_id)
             reservation_key = (target_identity.scope_id, agent_id)
             reservation = self._pending_replies.get(reservation_key)
             if reservation is None:
                 if status not in CONCURRENCY_COUNTED_STATUSES:
                     self._enforce_concurrency_limits_locked(
-                        load_config(),
+                        config,
                         provider=provider,
                         model=model,
                     )
@@ -731,9 +774,31 @@ class DaemonState:
     def _reap_closed_parents(self) -> None:
         while True:
             time.sleep(1.0)
+            # Config TUI writes are atomic, so periodically fold persistence
+            # policy into long-lived managers even when no client command is
+            # currently touching them.
             with self._lock:
                 if self._closed:
                     return
+                has_managers = bool(self._managers)
+            if has_managers:
+                try:
+                    config = load_config()
+                    session_policy = self._configured_session_policy(config)
+                except Exception:
+                    # A manual invalid/transient config must not kill the parent
+                    # reaper or replace the last valid live policy.
+                    session_policy = None
+            else:
+                session_policy = None
+            with self._lock:
+                if self._closed:
+                    return
+                if (
+                    self._managers
+                    and session_policy is not None
+                ):
+                    self._apply_session_policy_locked(session_policy)
                 dead_scope_ids = []
                 for scope_id, identity in self._identities.items():
                     if identity.owner_pid is not None:

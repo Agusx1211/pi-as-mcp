@@ -315,6 +315,13 @@ read and folded in. The easiest way to manage all of this is `pi-agent config`
 [Idle Worker Eviction](#idle-worker-eviction): raise it (or `0`) for interactive
 sessions to avoid cold respawn + session replay, keep it low for fan-out.
 
+Changes to these settings take effect without restarting the daemon. New agents
+use the latest persistence setting, and persisted agents use the latest idle
+eviction threshold. Persistence itself is fixed when an agent starts: disabling
+it leaves existing persisted agents resumable but prevents further idle
+eviction, while enabling it does not attempt to retrofit already-running
+ephemeral agents. Those ephemeral agents remain resident until stopped.
+
 ### Unsafe Read-Only
 
 `read-only` agents have no shell, so they cannot run `git`, build, or test

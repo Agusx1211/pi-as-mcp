@@ -717,6 +717,31 @@ class PiAgentSession:
     def _persist_enabled(self) -> bool:
         return self.session_dir is not None
 
+    def _apply_session_policy(
+        self,
+        *,
+        persist_sessions: bool,
+        idle_eviction_seconds: float,
+    ) -> None:
+        """Apply live config without making an existing session unsafe.
+
+        Persistence is a launch-time capability: an ephemeral worker has no
+        durable conversation to resume, while a persisted worker may already be
+        evicted and depend on its original session directory. Keep that
+        capability immutable for the agent's lifetime. The eviction threshold
+        can change live for persisted agents; disabling persistence therefore
+        disables further eviction without stranding already-persisted agents.
+        """
+        with self._lock:
+            if not self._persist_enabled:
+                # Enabling persistence cannot safely retrofit the conversation
+                # of a worker launched with --no-session.
+                self.idle_eviction_seconds = 0
+            else:
+                self.idle_eviction_seconds = (
+                    idle_eviction_seconds if persist_sessions else 0
+                )
+
     def _start_worker_locked(self) -> None:
         """Spawn (or respawn) the Pi RPC subprocess and start its IO readers.
 
@@ -1683,6 +1708,29 @@ class SessionManager:
         self._session_dir = session_dir
         self._idle_eviction_seconds = idle_eviction_seconds
 
+    def apply_session_policy(
+        self,
+        *,
+        session_dir: Path | None,
+        idle_eviction_seconds: float,
+    ) -> None:
+        """Update defaults and safely apply live policy to existing agents."""
+        persist_sessions = session_dir is not None
+        with self._lock:
+            self._session_dir = session_dir
+            self._idle_eviction_seconds = idle_eviction_seconds
+            for session in self._sessions.values():
+                session._apply_session_policy(
+                    persist_sessions=persist_sessions,
+                    idle_eviction_seconds=idle_eviction_seconds,
+                )
+
+    def _current_session_policy_locked(self) -> tuple[Path | None, float]:
+        idle_eviction_seconds = (
+            self._idle_eviction_seconds if self._session_dir is not None else 0
+        )
+        return self._session_dir, idle_eviction_seconds
+
     def start(
         self,
         *,
@@ -1695,6 +1743,8 @@ class SessionManager:
         unsafe_read_only: bool = False,
     ) -> SessionSnapshot:
         agent_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            session_dir, idle_eviction_seconds = self._current_session_policy_locked()
         session = PiAgentSession(
             agent_id=agent_id,
             runner=self._runner,
@@ -1707,12 +1757,21 @@ class SessionManager:
             observer=self._observer,
             transcript_sink=self._transcript_sink,
             unsafe_read_only=unsafe_read_only,
-            session_dir=self._session_dir,
-            idle_eviction_seconds=self._idle_eviction_seconds,
+            session_dir=session_dir,
+            idle_eviction_seconds=idle_eviction_seconds,
         )
         with self._lock:
             closed = self._closed
             if not closed:
+                # Config can change while Pi validates/spawns. Reconcile the new
+                # session before publishing it so starts are atomic with respect
+                # to the manager's latest policy. The session itself preserves
+                # its launch-time persistence capability where necessary.
+                current_dir, current_idle = self._current_session_policy_locked()
+                session._apply_session_policy(
+                    persist_sessions=current_dir is not None,
+                    idle_eviction_seconds=current_idle,
+                )
                 self._sessions[agent_id] = session
         if closed:
             # The manager was closed (parent died) while the worker was
@@ -1740,7 +1799,17 @@ class SessionManager:
     ) -> tuple[SessionSnapshot, dict[str, Any]]:
         """Reply and also return the prompt ack, which carries the pre-prompt
         ``turn_count_before``/``was_running`` captured under the session lock."""
-        session = self._get(agent_id)
+        with self._lock:
+            session = self._sessions.get(agent_id)
+            if session is None:
+                raise PiRpcError(f"unknown agent_id: {agent_id}")
+            session_dir, idle_eviction_seconds = self._current_session_policy_locked()
+            # An evicted worker must see the latest policy before send() decides
+            # whether and how to resume it.
+            session._apply_session_policy(
+                persist_sessions=session_dir is not None,
+                idle_eviction_seconds=idle_eviction_seconds,
+            )
         ack = session.send(prompt, behavior=behavior)
         return session.snapshot(), ack
 
