@@ -200,6 +200,45 @@ while True:
     return path
 
 
+def write_replyable_fake_pi(tmp_path: Path) -> Path:
+    path = tmp_path / "fake-pi-daemon-replyable"
+    path.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+import time
+
+if "--list-models" in sys.argv:
+    print("provider   model                    context")
+    print("local  example-model  128K")
+    raise SystemExit(0)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    message = request["message"]
+    if message == "run":
+        time.sleep(0.3)
+    print(json.dumps({
+        "id": request["id"],
+        "type": "response",
+        "command": "prompt",
+        "success": True,
+    }), flush=True)
+    print(json.dumps({"type": "agent_start"}), flush=True)
+    if message.startswith("idle"):
+        answer = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "idle now"}],
+        }
+        print(json.dumps({"type": "message_end", "message": answer}), flush=True)
+        print(json.dumps({"type": "agent_end", "messages": [answer]}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
 def write_recording_fake_pi(tmp_path: Path) -> Path:
     path = tmp_path / "fake-pi-recording"
     path.write_text(
@@ -670,6 +709,82 @@ def test_daemon_idle_agents_do_not_consume_concurrency(tmp_path: Path, monkeypat
             include_events=False,
         )
         assert second["agent_id"] != first_id
+    finally:
+        state.close()
+
+
+def test_daemon_concurrent_idle_replies_respect_limit_and_running_reply_is_allowed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_pi = write_replyable_fake_pi(tmp_path)
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(write_config(tmp_path, {"example-model": 1})))
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="reply-limit-scope", owner_pid=None, label="reply-limit")
+    try:
+        manager = state.manager_for(identity)
+        manager._runner.pi_bin = str(fake_pi)
+
+        agent_ids: list[str] = []
+        for prompt in ("idle first", "idle second"):
+            started = state.start(
+                identity,
+                prompt=prompt,
+                cwd=str(tmp_path),
+                model="local/example-model",
+                provider=None,
+                tool_mode="none",
+                include_events=False,
+            )
+            agent_id = str(started["agent_id"])
+            agent_ids.append(agent_id)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if manager.peek(agent_id).status == "idle":
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(f"agent {agent_id} never went idle")
+
+        results: dict[str, tuple[str, object]] = {}
+        barrier = threading.Barrier(2)
+
+        def resume(agent_id: str) -> None:
+            barrier.wait()
+            try:
+                snapshot, ack, _target = state.reply(
+                    identity,
+                    agent_id=agent_id,
+                    prompt="run",
+                    behavior="auto",
+                )
+                results[agent_id] = ("ok", (snapshot, ack))
+            except PiRpcError as exc:
+                results[agent_id] = ("err", str(exc))
+
+        threads = [threading.Thread(target=resume, args=(agent_id,)) for agent_id in agent_ids]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert sorted(result[0] for result in results.values()) == ["err", "ok"]
+        rejection = next(result[1] for result in results.values() if result[0] == "err")
+        assert "concurrency limit reached" in str(rejection)
+
+        running_agent_id = next(
+            agent_id for agent_id, result in results.items() if result[0] == "ok"
+        )
+        snapshot, ack, _target = state.reply(
+            identity,
+            agent_id=running_agent_id,
+            prompt="keep going",
+            behavior="auto",
+        )
+        assert snapshot.status == "running"
+        assert ack["was_running"] is True
     finally:
         state.close()
 
