@@ -174,6 +174,36 @@ def _wait_for_daemon(socket_path: Path, timeout: float = 10) -> None:
     raise AssertionError(f"daemon did not listen on {socket_path}")
 
 
+def _running_pids(pids: set[int]) -> set[int]:
+    running: set[int] = set()
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        running.add(pid)
+    return running
+
+
+def _stop_daemons(pids: list[int]) -> None:
+    remaining = set(pids)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while remaining and time.monotonic() < deadline:
+        remaining = _running_pids(remaining)
+        if remaining:
+            time.sleep(0.05)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 @pytest.mark.skipif(
     not sys.platform.startswith("linux") or shutil.which("uv") is None,
     reason="live refresh exercise requires Linux /proc and uv",
@@ -223,8 +253,4 @@ def test_refresh_script_restarts_daemon_in_runtime_path_with_spaces(
         if old_daemon.poll() is None:
             old_daemon.terminate()
             old_daemon.wait(timeout=5)
-        for pid in new_pids or daemon_pids(runtime_path, socket_path):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        _stop_daemons(new_pids or daemon_pids(runtime_path, socket_path))
