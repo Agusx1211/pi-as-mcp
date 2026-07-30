@@ -160,15 +160,17 @@ def stats_summary_label(stats: dict[str, Any] | None) -> str:
         return "agents 0  observed 0  unobserved 0  scores 0"
     avg_score = stats.get("average_score")
     avg = f"{number_value(avg_score):.2f}" if number_value(avg_score) is not None else "--"
-    return "  ".join(
-        [
-            f"agents {format_count(stats.get('total_agents'))}",
-            f"observed {format_count(stats.get('observed_agents'))}",
-            f"unobserved {format_count(stats.get('unobserved_agents'))}",
-            f"scores {format_count(stats.get('scores'))}",
-            f"avg score {avg}",
-        ]
-    )
+    parts = [
+        f"agents {format_count(stats.get('total_agents'))}",
+        f"observed {format_count(stats.get('observed_agents'))}",
+        f"unobserved {format_count(stats.get('unobserved_agents'))}",
+        f"scores {format_count(stats.get('scores'))}",
+        f"avg score {avg}",
+    ]
+    telemetry = stats.get("telemetry")
+    if isinstance(telemetry, dict) and not telemetry.get("healthy", True):
+        parts.append(f"telemetry errors {format_count(telemetry.get('failure_count'))}")
+    return "  ".join(parts)
 
 
 def agent_spawn_rank(agent: dict[str, Any]) -> float:
