@@ -35,6 +35,16 @@ def socket_path() -> Path:
     return runtime_dir() / "daemon.sock"
 
 
+def daemon_start_lock_path() -> Path:
+    """Persistent per-runtime lock used to serialize daemon cold starts.
+
+    The file is intentionally never unlinked. Removing a lock file while
+    contenders still have it open creates multiple inodes that can be locked
+    independently, defeating startup coordination.
+    """
+    return runtime_dir() / "daemon.start.lock"
+
+
 def session_dir() -> Path:
     """Directory where Pi persists per-agent session logs.
 

@@ -970,6 +970,10 @@ def attach_agent_stats(data: dict[str, Any]) -> None:
 class UnixServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver's default is five. A cold fan-out of MCP parents can fill
+    # that queue before handler threads begin accepting, producing EAGAIN even
+    # though the daemon is healthy.
+    request_queue_size = 128
 
 
 def serve() -> None:
