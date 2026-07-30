@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import stat
 import subprocess
+import struct
 import threading
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,8 +18,83 @@ from pi_as_mcp.daemon import (
     ParentIdentity,
     agent_spawn_rank,
     exposed_model_aliases,
+    parent_identity_from_peer,
+    unix_socket_peer_pid,
 )
 from pi_as_mcp.pi_rpc import PiRpcError
+
+
+def test_unix_socket_peer_pid_uses_linux_peer_credentials() -> None:
+    peer_socket = Mock()
+    peer_socket.getsockopt.return_value = struct.pack("=3i", 1234, 1000, 1000)
+
+    assert unix_socket_peer_pid(peer_socket, platform_name="linux") == 1234
+    peer_socket.getsockopt.assert_called_once_with(
+        socket.SOL_SOCKET,
+        socket.SO_PEERCRED,
+        struct.calcsize("=3i"),
+    )
+
+
+def test_unix_socket_peer_pid_uses_darwin_local_peerpid(monkeypatch) -> None:
+    peer_socket = Mock()
+    peer_socket.getsockopt.return_value = struct.pack("=i", 4321)
+    monkeypatch.delattr(socket, "SOL_LOCAL", raising=False)
+    monkeypatch.delattr(socket, "LOCAL_PEERPID", raising=False)
+
+    assert unix_socket_peer_pid(peer_socket, platform_name="darwin") == 4321
+    peer_socket.getsockopt.assert_called_once_with(
+        0,
+        0x002,
+        struct.calcsize("=i"),
+    )
+
+
+def test_unix_socket_peer_pid_fails_closed_when_credentials_are_unavailable() -> None:
+    peer_socket = Mock()
+    peer_socket.getsockopt.side_effect = OSError("not supported")
+
+    with pytest.raises(PiRpcError, match="could not determine Unix socket peer PID"):
+        unix_socket_peer_pid(peer_socket, platform_name="darwin")
+
+
+def test_unix_socket_peer_pid_requires_linux_so_peercred(monkeypatch) -> None:
+    monkeypatch.delattr(socket, "SO_PEERCRED")
+
+    with pytest.raises(PiRpcError, match="SO_PEERCRED is unavailable"):
+        unix_socket_peer_pid(Mock(), platform_name="linux")
+
+
+def test_unix_socket_peer_pid_rejects_invalid_pid() -> None:
+    peer_socket = Mock()
+    peer_socket.getsockopt.return_value = struct.pack("=i", 0)
+
+    with pytest.raises(PiRpcError, match="invalid peer PID 0"):
+        unix_socket_peer_pid(peer_socket, platform_name="darwin")
+
+
+def test_unix_socket_peer_pid_rejects_unsupported_platform() -> None:
+    with pytest.raises(PiRpcError, match="unsupported on freebsd"):
+        unix_socket_peer_pid(Mock(), platform_name="freebsd")
+
+
+def test_peer_pid_supports_mcp_owner_validation_and_cli_scoping() -> None:
+    peer_socket = Mock()
+    peer_socket.getsockopt.return_value = struct.pack("=i", 4321)
+    peer_pid = unix_socket_peer_pid(peer_socket, platform_name="darwin")
+
+    mcp_identity = parent_identity_from_peer(
+        peer_pid,
+        parent_hint="mcp:instance",
+        parent_owner_pid=4321,
+    )
+    cli_identity = parent_identity_from_peer(peer_pid)
+
+    assert mcp_identity.owner_pid == 4321
+    assert mcp_identity.peer_pid == 4321
+    assert cli_identity.owner_pid is None
+    assert cli_identity.peer_pid == 4321
+    assert cli_identity.scope_id == parent_identity_from_peer(4321).scope_id
 
 
 def test_exposed_model_aliases_drops_disabled_and_adds_description(tmp_path, monkeypatch) -> None:
