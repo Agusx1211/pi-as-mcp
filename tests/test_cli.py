@@ -50,8 +50,12 @@ def test_summary_uses_global_agent_view_by_default(monkeypatch, capsys) -> None:
 
 def test_summary_can_use_scoped_agent_view(monkeypatch) -> None:
     calls: list[str] = []
+    client_options: list[dict[str, str]] = []
 
     class FakeClient:
+        def __init__(self, **kwargs):
+            client_options.append(kwargs)
+
         def request(self, command: str, **kwargs):
             calls.append(command)
             return {"agents": []}
@@ -62,3 +66,4 @@ def test_summary_can_use_scoped_agent_view(monkeypatch) -> None:
     cli.main()
 
     assert calls == ["summary"]
+    assert client_options == [{"default_scope_mode": "cli-shell"}]

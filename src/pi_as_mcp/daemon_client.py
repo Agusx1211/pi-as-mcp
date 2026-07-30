@@ -39,15 +39,24 @@ class _SocketState(enum.Enum):
 
 
 class DaemonClient:
-    def __init__(self, *, default_parent_hint: str | None = None, parent_owner_pid: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        default_parent_hint: str | None = None,
+        parent_owner_pid: int | None = None,
+        default_scope_mode: str | None = None,
+    ) -> None:
         self.default_parent_hint = default_parent_hint
         self.parent_owner_pid = parent_owner_pid
+        self.default_scope_mode = default_scope_mode
 
     def request(self, command: str, *, request_timeout_seconds: int = 30, **params: Any) -> dict[str, Any]:
         payload = {"command": command, **params}
         parent_hint = os.environ.get("PI_AGENT_PARENT_ID") or self.default_parent_hint
         if parent_hint:
             payload["parent_hint"] = parent_hint
+        elif self.default_scope_mode:
+            payload["parent_scope_mode"] = self.default_scope_mode
         if self.parent_owner_pid is not None:
             payload["parent_owner_pid"] = self.parent_owner_pid
 

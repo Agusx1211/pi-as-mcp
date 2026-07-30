@@ -164,7 +164,17 @@ pi-agent skill          # print the MCP-provided skill
 
 `pi-agent list` is an alias for `pi-agent summary`. By default it shows all
 live agents across parent scopes. Pass `--scoped` to show only agents in the
-current CLI parent scope.
+current CLI shell scope. Separate `pi-agent` invocations launched by the same
+shell share that scope; a different shell gets a separate scope. The daemon
+authenticates the client process tree and includes the shell's process start
+identity, so a reused PID cannot inherit an old scope. Agents in an automatic
+CLI shell scope are stopped when that shell exits.
+
+Set `PI_AGENT_PARENT_ID=<name>` to choose an explicit scope instead. Explicit
+scope names can intentionally be reused across shells and are not tied to a
+shell lifetime. This is also the fallback for launch environments where the
+daemon cannot identify a stable shell ancestor; scoped operations fail with
+actionable guidance rather than silently selecting a one-process scope.
 
 `pi-agent tui` / `pi-agent-tui` opens the interactive dashboard shown above.
 

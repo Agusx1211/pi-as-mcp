@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import stat
 import subprocess
@@ -18,8 +19,10 @@ from pi_as_mcp.daemon import (
     ParentIdentity,
     RequestHandler,
     agent_spawn_rank,
+    cli_parent_identity_from_peer,
     exposed_model_aliases,
     parent_identity_from_peer,
+    process_identity_matches,
     unix_socket_peer_pid,
 )
 from pi_as_mcp.pi_rpc import PiRpcError
@@ -96,6 +99,82 @@ def test_peer_pid_supports_mcp_owner_validation_and_cli_scoping() -> None:
     assert cli_identity.owner_pid is None
     assert cli_identity.peer_pid == 4321
     assert cli_identity.scope_id == parent_identity_from_peer(4321).scope_id
+
+
+def _spawn_shell_with_cli_peers(
+    tmp_path: Path, name: str
+) -> tuple[subprocess.Popen[bytes], tuple[int, int]]:
+    pid_file = tmp_path / f"{name}.pids"
+    shell = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            'sleep 60 & first=$!; sleep 60 & second=$!; '
+            'printf "%s %s" "$first" "$second" > "$1"; wait',
+            "bash",
+            str(pid_file),
+        ],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if pid_file.exists() and pid_file.read_text(encoding="utf-8").strip():
+            first, second = pid_file.read_text(encoding="utf-8").split()
+            return shell, (int(first), int(second))
+        time.sleep(0.02)
+    shell.terminate()
+    shell.wait(timeout=5)
+    raise AssertionError("test shell did not publish child PIDs")
+
+
+def _stop_test_shell(shell: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(shell.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    shell.wait(timeout=5)
+
+
+def test_cli_scope_is_stable_across_processes_and_isolated_between_shells(
+    tmp_path: Path,
+) -> None:
+    first_shell, first_peers = _spawn_shell_with_cli_peers(tmp_path, "first")
+    second_shell, second_peers = _spawn_shell_with_cli_peers(tmp_path, "second")
+    try:
+        first = cli_parent_identity_from_peer(first_peers[0])
+        same_shell = cli_parent_identity_from_peer(first_peers[1])
+        other_shell = cli_parent_identity_from_peer(second_peers[0])
+
+        assert first.scope_id == same_shell.scope_id
+        assert first.owner_pid == same_shell.owner_pid == first_shell.pid
+        assert first.owner_start_time == same_shell.owner_start_time
+        assert first.scope_id != other_shell.scope_id
+        assert other_shell.owner_pid == second_shell.pid
+    finally:
+        _stop_test_shell(first_shell)
+        _stop_test_shell(second_shell)
+
+
+def test_cli_scope_fails_with_actionable_guidance_without_stable_shell(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pi_as_mcp.daemon.process_info",
+        lambda pid: {
+            100: {"pid": 100, "ppid": 50, "start_time": "one", "command": "pi-agent"},
+            50: {"pid": 50, "ppid": 1, "start_time": "two", "command": "editor"},
+        }.get(pid),
+    )
+
+    with pytest.raises(PiRpcError, match="set PI_AGENT_PARENT_ID=<name>"):
+        parent_identity_from_peer(100, parent_scope_mode="cli-shell")
+
+
+def test_process_identity_match_rejects_reused_owner_pid(monkeypatch) -> None:
+    monkeypatch.setattr("pi_as_mcp.daemon.pid_exists", lambda pid: True)
+    monkeypatch.setattr("pi_as_mcp.daemon.proc_stat", lambda pid: (1, "new-start"))
+
+    assert process_identity_matches(1234, "old-start") is False
 
 
 def test_exposed_model_aliases_drops_disabled_and_adds_description(tmp_path, monkeypatch) -> None:
