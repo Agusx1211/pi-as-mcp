@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -345,6 +346,79 @@ def test_ensure_wait_shim_heals_non_executable_shim(tmp_path: Path, monkeypatch)
     shim.chmod(0o600)  # simulate the crashed half-written state
     shim = Path(server.ensure_wait_shim())
     assert shim.stat().st_mode & stat.S_IXUSR
+
+
+def test_wait_shim_keeps_custom_runtime_without_parent_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    custom_runtime = tmp_path / "custom runtime's namespace"
+    custom_runtime.mkdir()
+    monkeypatch.setenv("PI_AS_MCP_RUNTIME_DIR", str(custom_runtime))
+
+    fake_python = tmp_path / "fake python"
+    fake_python.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import socket
+import sys
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.connect(os.path.join(os.environ["PI_AS_MCP_RUNTIME_DIR"], "daemon.sock"))
+    client.sendall((json.dumps({"argv": sys.argv[1:]}) + "\\n").encode())
+    print(client.recv(65536).decode(), end="")
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o700)
+    monkeypatch.setattr(server.sys, "executable", str(fake_python))
+
+    command = server.wait_command("agent-1", after_turn_count=2)
+
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    decoy = decoy_dir / "piw"
+    decoy.write_text("#!/bin/sh\necho wrong-piw\nexit 99\n", encoding="utf-8")
+    decoy.chmod(0o700)
+
+    received: list[dict] = []
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(custom_runtime / "daemon.sock"))
+    listener.listen()
+
+    def serve_once() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            payload = b""
+            while not payload.endswith(b"\n"):
+                payload += connection.recv(65536)
+            received.append(json.loads(payload))
+            connection.sendall(b'{"namespace":"custom"}')
+
+    thread = threading.Thread(target=serve_once)
+    thread.start()
+    try:
+        child_env = os.environ.copy()
+        child_env.pop("PI_AS_MCP_RUNTIME_DIR")
+        child_env["PATH"] = f"{decoy_dir}{os.pathsep}{child_env['PATH']}"
+        completed = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=child_env,
+            timeout=5,
+        )
+    finally:
+        thread.join(timeout=5)
+        listener.close()
+
+    assert not thread.is_alive()
+    assert json.loads(completed.stdout) == {"namespace": "custom"}
+    assert received == [
+        {"argv": ["-m", "pi_as_mcp.cli", "wait", "agent-1", "-a", "2"]}
+    ]
 
 
 # --- paths: refuse a runtime dir we do not own -------------------------------
