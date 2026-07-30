@@ -51,6 +51,8 @@ def test_missing_config_is_empty(tmp_path, monkeypatch: pytest.MonkeyPatch) -> N
     assert loaded.path is None
     assert loaded.agents.enable_score is False
     assert loaded.agents.model_concurrency_limits == {}
+    assert loaded.extensions.whitelist == ()
+    assert loaded.extensions.settings == {}
 
 
 def test_invalid_model_limit_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,6 +210,71 @@ def test_skill_config_parses(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     config.write_text(json.dumps({"skill": {"intro": "hi"}}), encoding="utf-8")
     monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
     assert load_config().skill.intro == "hi"
+
+
+def test_extension_whitelist_and_settings_parse(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "whitelist": [
+                        "npm:pi-loop-police",
+                        " /opt/pi/extensions/plan.ts ",
+                        "npm:pi-loop-police",
+                    ],
+                    "settings": {
+                        "plan": True,
+                        "preset": "review",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+
+    extensions = load_config().extensions
+
+    assert extensions.whitelist == (
+        "npm:pi-loop-police",
+        "/opt/pi/extensions/plan.ts",
+    )
+    assert extensions.settings == {"plan": True, "preset": "review"}
+
+
+@pytest.mark.parametrize(
+    ("extensions", "message"),
+    [
+        ([], "extensions must be an object"),
+        ({"whitelist": "npm:example"}, "whitelist must be an array"),
+        ({"whitelist": [""]}, "entries must be non-empty strings"),
+        (
+            {"whitelist": ["npm:example"], "settings": {"--plan": True}},
+            "without leading dashes",
+        ),
+        (
+            {"whitelist": ["npm:example"], "settings": {"plan": False}},
+            "strings or true",
+        ),
+        (
+            {"settings": {"plan": True}},
+            "requires a non-empty extensions.whitelist",
+        ),
+    ],
+)
+def test_invalid_extension_config_is_rejected(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    extensions,
+    message: str,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"extensions": extensions}), encoding="utf-8")
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+
+    with pytest.raises(PiRpcError, match=message):
+        load_config()
 
 
 def test_invalid_disabled_flag_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

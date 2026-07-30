@@ -301,6 +301,41 @@ The daemon reads optional settings from a single user-global file:
 There is no per-project config. Set `PI_AS_MCP_CONFIG=/path/to/config.json` to
 use an explicit path.
 
+### Extensions
+
+Pi extension discovery stays disabled for delegated workers. To load selected
+extensions, add their Pi sources to the explicit whitelist:
+
+```json
+{
+  "extensions": {
+    "whitelist": [
+      "npm:pi-loop-police",
+      "/absolute/path/to/plan.ts"
+    ],
+    "settings": {
+      "plan": true,
+      "preset": "review"
+    }
+  }
+}
+```
+
+Each whitelist entry is passed to Pi as an explicit `--extension` source, so
+package sources and local files/directories accepted by Pi are supported.
+Nothing is loaded when the whitelist is absent or empty, preserving the default
+isolation.
+
+`settings` overrides flags registered by the whitelisted extensions. Keys omit
+the leading `--`; values are strings or `true`. Pi boolean extension flags can
+only be enabled, so use the extension's negative flag (if it provides one) to
+turn a default off. Extensions that use their own config files or environment
+variables continue to manage those independently.
+
+Extension selection and settings are fixed when an agent starts and are reused
+if its persisted worker is evicted and resumed. Config changes apply to newly
+created agents.
+
 ### Per-Model Settings
 
 Each model pi-as-mcp can use gets an optional entry under `agents.models`, keyed
@@ -397,9 +432,10 @@ The TUI auto-discovers every model in `pi --list-models` and lets you, per
 model: set a concurrency limit (`l`), write a description/rules (`e`), or disable
 it (`d`). It also toggles the global settings — unsafe read-only (`u`), scoring
 (`c`), session persistence (`p`), idle eviction (`i`) — and edits the skill
-intro (`t`). It flags any config entry for a model Pi no longer knows about.
-Press `w` to save. The server reflects saved changes on its next read (the
-resource is live; the always-in-context instructions refresh on reconnect).
+intro (`t`) and extension JSON (`x`). It flags any config entry for a model Pi
+no longer knows about. Press `w` to save. The server reflects saved changes on
+its next read (the resource is live; the always-in-context instructions refresh
+on reconnect).
 
 The custom intro lives under a `skill` block in the config:
 

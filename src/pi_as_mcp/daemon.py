@@ -495,6 +495,8 @@ class DaemonState:
                 tool_mode=tool_mode,
                 include_events=include_events,
                 unsafe_read_only=config.agents.unsafe_read_only,
+                extension_whitelist=config.extensions.whitelist,
+                extension_settings=config.extensions.settings,
             )
         finally:
             # The session (if started) is now registered with its manager and

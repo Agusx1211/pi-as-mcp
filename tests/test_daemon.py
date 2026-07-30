@@ -728,6 +728,68 @@ def test_daemon_unsafe_read_only_config_upgrades_read_only_requests(tmp_path: Pa
         state.close()
 
 
+def test_daemon_passes_extension_whitelist_and_settings_to_worker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_pi = write_recording_fake_pi(tmp_path)
+    config = tmp_path / "extensions.json"
+    config.write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "whitelist": [
+                        "npm:pi-loop-police",
+                        "/opt/pi/extensions/plan.ts",
+                    ],
+                    "settings": {
+                        "plan": True,
+                        "preset": "review mode",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="extensions-scope", owner_pid=None, label="x")
+    try:
+        state.manager_for(identity)._runner.pi_bin = str(fake_pi)
+        state.start(
+            identity,
+            prompt="inspect extensions",
+            cwd=str(tmp_path),
+            model="local/example-model",
+            provider=None,
+            tool_mode="read-only",
+            include_events=False,
+        )
+
+        call_path = tmp_path / "daemon-worker-call.json"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if call_path.exists():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("worker did not record its launch")
+
+        argv = json.loads(call_path.read_text(encoding="utf-8"))["argv"]
+        assert "--no-extensions" in argv
+        assert [
+            argv[index + 1]
+            for index, value in enumerate(argv)
+            if value == "--extension"
+        ] == ["npm:pi-loop-police", "/opt/pi/extensions/plan.ts"]
+        assert "--plan=true" in argv
+        assert "--preset=review mode" in argv
+    finally:
+        state.close()
+
+
 def test_daemon_reaps_sessions_when_owner_pid_exits(tmp_path: Path) -> None:
     fake_pi = write_fake_pi(tmp_path)
     owner = subprocess.Popen(["sleep", "60"])

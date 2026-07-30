@@ -121,3 +121,36 @@ def test_edit_intro_then_save(tmp_path, monkeypatch) -> None:
     anyio.run(check)
     saved = json.loads(cfg.read_text(encoding="utf-8"))
     assert saved["skill"]["intro"].startswith("yo")
+
+
+def test_extension_config_round_trips_through_editor(tmp_path, monkeypatch) -> None:
+    cfg = _setup(
+        tmp_path,
+        monkeypatch,
+        {
+            "extensions": {
+                "whitelist": ["npm:pi-loop-police"],
+                "settings": {"strict": True, "profile": "subagent"},
+            }
+        },
+    )
+
+    async def check() -> None:
+        app = config_tui.PiConfigTui(runner=FakeRunner())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.draft.extension_whitelist == ["npm:pi-loop-police"]
+            assert app.draft.extension_settings == {
+                "strict": True,
+                "profile": "subagent",
+            }
+            await pilot.press("w")
+            await pilot.pause()
+
+    anyio.run(check)
+
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert saved["extensions"] == {
+        "whitelist": ["npm:pi-loop-police"],
+        "settings": {"strict": True, "profile": "subagent"},
+    }

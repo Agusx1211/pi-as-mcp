@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pi_as_mcp.pi_rpc import PiRpcError
+from pi_as_mcp.pi_rpc import ExtensionSetting, PiRpcError
 from pi_as_mcp.sessions import DEFAULT_IDLE_EVICTION_SECONDS
 
 CONFIG_ENV = "PI_AS_MCP_CONFIG"
@@ -107,9 +107,19 @@ class SkillConfig:
 
 
 @dataclass(frozen=True)
+class ExtensionsConfig:
+    # Explicit Pi extension sources. Pi discovery remains disabled, so this is
+    # the complete allowlist used by delegated workers.
+    whitelist: tuple[str, ...] = ()
+    # Pi extension CLI flag values, keyed without the leading "--".
+    settings: dict[str, ExtensionSetting] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     agents: AgentsConfig
     skill: SkillConfig = field(default_factory=SkillConfig)
+    extensions: ExtensionsConfig = field(default_factory=ExtensionsConfig)
     path: Path | None = None
 
 
@@ -187,7 +197,12 @@ def load_config() -> AppConfig:
             return cached[1]
 
     if stat_key is None:
-        result = AppConfig(agents=AgentsConfig(models={}), skill=SkillConfig(), path=None)
+        result = AppConfig(
+            agents=AgentsConfig(models={}),
+            skill=SkillConfig(),
+            extensions=ExtensionsConfig(),
+            path=None,
+        )
         with _CONFIG_LOCK:
             _CONFIG_CACHE[cache_key] = (None, result)
         return result
@@ -203,6 +218,7 @@ def parse_app_config(payload: dict[str, Any], *, path: Path) -> AppConfig:
     return AppConfig(
         agents=parse_agents_config(payload.get("agents"), path=path),
         skill=parse_skill_config(payload.get("skill"), path=path),
+        extensions=parse_extensions_config(payload.get("extensions"), path=path),
         path=path,
     )
 
@@ -331,3 +347,62 @@ def parse_skill_config(value: Any, *, path: Path) -> SkillConfig:
         raise PiRpcError(f"pi-as-mcp config skill.intro must be a string: {path}")
 
     return SkillConfig(intro=intro)
+
+
+def parse_extensions_config(value: Any, *, path: Path) -> ExtensionsConfig:
+    if value is None:
+        return ExtensionsConfig()
+    if not isinstance(value, dict):
+        raise PiRpcError(f"pi-as-mcp config extensions must be an object: {path}")
+
+    raw_whitelist = value.get("whitelist", [])
+    if raw_whitelist is None:
+        raw_whitelist = []
+    if not isinstance(raw_whitelist, list):
+        raise PiRpcError(f"pi-as-mcp config extensions.whitelist must be an array: {path}")
+
+    whitelist: list[str] = []
+    seen_sources: set[str] = set()
+    for index, source in enumerate(raw_whitelist):
+        if not isinstance(source, str) or not source.strip():
+            raise PiRpcError(
+                "pi-as-mcp config extensions.whitelist entries must be "
+                f"non-empty strings: {path}: index {index}"
+            )
+        normalized = source.strip()
+        if normalized not in seen_sources:
+            whitelist.append(normalized)
+            seen_sources.add(normalized)
+
+    raw_settings = value.get("settings", {})
+    if raw_settings is None:
+        raw_settings = {}
+    if not isinstance(raw_settings, dict):
+        raise PiRpcError(f"pi-as-mcp config extensions.settings must be an object: {path}")
+
+    settings: dict[str, ExtensionSetting] = {}
+    for name, setting in raw_settings.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.startswith("-")
+            or "=" in name
+            or any(character.isspace() for character in name)
+        ):
+            raise PiRpcError(
+                "pi-as-mcp config extensions.settings keys must be extension "
+                f"flag names without leading dashes, whitespace, or '=': {path}: {name!r}"
+            )
+        if setting is False or not isinstance(setting, (str, bool)):
+            raise PiRpcError(
+                "pi-as-mcp config extensions.settings values must be strings "
+                f"or true: {path}: {name!r}"
+            )
+        settings[name] = setting
+
+    if settings and not whitelist:
+        raise PiRpcError(
+            f"pi-as-mcp config extensions.settings requires a non-empty extensions.whitelist: {path}"
+        )
+
+    return ExtensionsConfig(whitelist=tuple(whitelist), settings=settings)

@@ -208,10 +208,36 @@ def test_build_args_limits_read_only_tools() -> None:
     assert "rpc" in args
     assert "--thinking" not in args
     assert "--no-context-files" in args
+    assert "--no-extensions" in args
+    assert "--extension" not in args
     assert "--no-approve" in args
     assert "--tools" in args
     assert "read,grep,find,ls" in args
     assert "bash" not in ",".join(args)
+
+
+def test_build_args_loads_only_whitelisted_extensions_with_settings() -> None:
+    runner = PiRpcRunner(pi_bin="pi")
+
+    args = runner._build_args(
+        "local",
+        "example-model",
+        "full",
+        extension_whitelist=(
+            "npm:pi-loop-police",
+            "/opt/pi/extensions/plan.ts",
+        ),
+        extension_settings={"plan": True, "preset": "review mode"},
+    )
+
+    assert "--no-extensions" in args
+    assert [
+        args[index + 1]
+        for index, value in enumerate(args)
+        if value == "--extension"
+    ] == ["npm:pi-loop-police", "/opt/pi/extensions/plan.ts"]
+    assert "--plan=true" in args
+    assert "--preset=review mode" in args
 
 
 def test_unsafe_read_only_is_not_a_selectable_tool_mode() -> None:

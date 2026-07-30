@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 ToolMode = Literal["none", "read-only", "write", "full"]
+ExtensionSetting = str | Literal[True]
 
 DEFAULT_PI_BIN = "pi"
 DEFAULT_PI_AGENT_DIR = "~/.pi/agent"
@@ -581,6 +582,8 @@ class PiRpcRunner:
         *,
         session_id: str | None = None,
         session_dir: str | None = None,
+        extension_whitelist: tuple[str, ...] = (),
+        extension_settings: dict[str, ExtensionSetting] | None = None,
     ) -> list[str]:
         args = [
             self.pi_bin,
@@ -609,6 +612,11 @@ class PiRpcRunner:
             "--no-themes",
             "--no-approve",
         ]
+        for extension in extension_whitelist:
+            args.extend(["--extension", extension])
+        for name, value in (extension_settings or {}).items():
+            rendered = "true" if value is True else value
+            args.append(f"--{name}={rendered}")
         tools = TOOL_PROFILES[tool_mode]
         if tools:
             args.extend(["--tools", ",".join(tools)])

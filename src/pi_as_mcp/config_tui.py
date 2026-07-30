@@ -5,7 +5,8 @@ cross-tool skill. It surfaces the full Pi model catalog (auto-discovered via
 ``pi --list-models``) so you can, per model: set a concurrency limit, write a
 short human description/rules, or disable it (hide it from pi-as-mcp while
 leaving it enabled in Pi). It also flags config entries for models Pi no longer
-knows about, and toggles the global agent settings.
+knows about, toggles the global agent settings, and edits the explicit Pi
+extension allowlist and flag overrides.
 
 The editing model (:class:`ConfigDraft`) is deliberately Textual-free so it can
 be unit-tested directly; :class:`PiConfigTui` is a thin widget layer over it.
@@ -13,6 +14,7 @@ be unit-tested directly; :class:`PiConfigTui` is a thin widget layer over it.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,10 +31,12 @@ from pi_as_mcp.config import (
     config_path,
     load_raw_config,
     parse_app_config,
+    parse_extensions_config,
     save_raw_config,
 )
 from pi_as_mcp.pi_rpc import (
     CatalogModel,
+    ExtensionSetting,
     PiRpcError,
     PiRpcRunner,
     configured_model_specs,
@@ -70,6 +74,8 @@ class ConfigDraft:
     persist_sessions: bool = True
     idle_eviction_seconds: float = 120.0
     skill_intro: str = ""
+    extension_whitelist: list[str] = field(default_factory=list)
+    extension_settings: dict[str, ExtensionSetting] = field(default_factory=dict)
     # Config model keys with no corresponding model in the Pi catalog (point 3).
     orphans: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Original parsed file, kept so unknown top-level keys survive a round-trip.
@@ -131,6 +137,8 @@ class ConfigDraft:
             persist_sessions=agents.persist_sessions,
             idle_eviction_seconds=agents.idle_eviction_seconds,
             skill_intro=config.skill.intro,
+            extension_whitelist=list(config.extensions.whitelist),
+            extension_settings=dict(config.extensions.settings),
             orphans=orphans,
             raw=raw,
         )
@@ -142,7 +150,11 @@ class ConfigDraft:
         catalog rows are folded into ``agents.models`` (full ``provider/model``
         refs). Unknown top-level keys and config-only orphan models are preserved.
         """
-        payload: dict[str, Any] = {k: v for k, v in self.raw.items() if k not in {"agents", "skill"}}
+        payload: dict[str, Any] = {
+            k: v
+            for k, v in self.raw.items()
+            if k not in {"agents", "skill", "extensions"}
+        }
 
         models: dict[str, Any] = {}
         for row in self.rows:
@@ -187,6 +199,19 @@ class ConfigDraft:
             skill_cfg["intro"] = self.skill_intro
         if skill_cfg:
             payload["skill"] = skill_cfg
+
+        extensions_cfg: dict[str, Any] = {}
+        raw_extensions = self.raw.get("extensions")
+        if isinstance(raw_extensions, dict):
+            for key, value in raw_extensions.items():
+                if key not in {"whitelist", "settings"}:
+                    extensions_cfg[key] = value
+        if self.extension_whitelist:
+            extensions_cfg["whitelist"] = list(self.extension_whitelist)
+        if self.extension_settings:
+            extensions_cfg["settings"] = dict(self.extension_settings)
+        if extensions_cfg:
+            payload["extensions"] = extensions_cfg
 
         return payload
 
@@ -281,6 +306,7 @@ class PiConfigTui(App[None]):
         ("c", "toggle_score", "Score"),
         ("p", "toggle_persist", "Persist"),
         ("i", "set_idle", "Idle evict"),
+        ("x", "edit_extensions", "Extensions"),
         ("t", "edit_intro", "Skill intro"),
         ("w", "save", "Save"),
         ("r", "reload", "Reload"),
@@ -376,6 +402,11 @@ class PiConfigTui(App[None]):
             f"  enable score (c):     {self._onoff(d.enable_score)}",
             f"  persist sessions (p): {self._onoff(d.persist_sessions)}",
             f"  idle evict secs (i):  {d.idle_eviction_seconds:g}",
+            "",
+            "[b]Extensions (x = edit)[/b]",
+            f"  allowed: {len(d.extension_whitelist)}",
+            f"  flag overrides: {len(d.extension_settings)}",
+            "  discovery stays disabled",
             "",
             "[b]Skill (t = edit intro)[/b]",
             f"  intro: {'custom' if d.skill_intro.strip() else 'default'}",
@@ -495,6 +526,45 @@ class PiConfigTui(App[None]):
 
         self.push_screen(
             PromptModal("Idle eviction seconds (0 = never)", value=f"{self.draft.idle_eviction_seconds:g}"),
+            done,
+        )
+
+    def action_edit_extensions(self) -> None:
+        def done(value: str | None) -> None:
+            if value is None:
+                return
+            value = value.strip()
+            if not value:
+                parsed: Any = {}
+            else:
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError as exc:
+                    self.notify(f"extensions must be valid JSON: {exc}", severity="error")
+                    return
+            try:
+                extensions = parse_extensions_config(parsed, path=config_path())
+            except PiRpcError as exc:
+                self.notify(str(exc), severity="error")
+                return
+            self.draft.extension_whitelist = list(extensions.whitelist)
+            self.draft.extension_settings = dict(extensions.settings)
+            self.mark_dirty("extensions updated")
+
+        current = json.dumps(
+            {
+                "whitelist": self.draft.extension_whitelist,
+                "settings": self.draft.extension_settings,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        self.push_screen(
+            PromptModal(
+                "Extensions JSON (whitelist + registered flag settings)",
+                value=current,
+                multiline=True,
+            ),
             done,
         )
 

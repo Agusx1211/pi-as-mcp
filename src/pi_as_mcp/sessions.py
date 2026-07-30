@@ -17,6 +17,7 @@ from typing import Any, Literal
 from pi_as_mcp.pi_rpc import (
     DEFAULT_MODEL_VALIDATION_TIMEOUT_SECONDS,
     READ_ONLY_GUARD,
+    ExtensionSetting,
     PiRpcError,
     PiRpcRunner,
     ToolCall,
@@ -617,6 +618,8 @@ class PiAgentSession:
         unsafe_read_only: bool = False,
         session_dir: Path | None = None,
         idle_eviction_seconds: float = DEFAULT_IDLE_EVICTION_SECONDS,
+        extension_whitelist: tuple[str, ...] = (),
+        extension_settings: dict[str, ExtensionSetting] | None = None,
     ) -> None:
         if not prompt.strip():
             raise PiRpcError("prompt must not be empty")
@@ -628,6 +631,8 @@ class PiAgentSession:
         # agent_id) so it can be evicted while idle and resumed on a later reply.
         self.session_dir = session_dir
         self.idle_eviction_seconds = idle_eviction_seconds
+        self.extension_whitelist = extension_whitelist
+        self.extension_settings = dict(extension_settings or {})
         self.cwd_path = resolve_cwd(cwd)
         self.model_spec = resolve_model(model, provider)
         self.tool_mode = tool_mode
@@ -754,6 +759,8 @@ class PiAgentSession:
             "full" if self._guard else self.tool_mode,
             session_id=self.agent_id if self._persist_enabled else None,
             session_dir=str(self.session_dir) if self._persist_enabled else None,
+            extension_whitelist=self.extension_whitelist,
+            extension_settings=self.extension_settings,
         )
         env = os.environ.copy()
         env["PI_OFFLINE"] = "1"
@@ -1756,6 +1763,8 @@ class SessionManager:
         tool_mode: ToolMode,
         include_events: bool,
         unsafe_read_only: bool = False,
+        extension_whitelist: tuple[str, ...] = (),
+        extension_settings: dict[str, ExtensionSetting] | None = None,
     ) -> SessionSnapshot:
         agent_id = uuid.uuid4().hex[:12]
         with self._lock:
@@ -1774,6 +1783,8 @@ class SessionManager:
             unsafe_read_only=unsafe_read_only,
             session_dir=session_dir,
             idle_eviction_seconds=idle_eviction_seconds,
+            extension_whitelist=extension_whitelist,
+            extension_settings=extension_settings,
         )
         with self._lock:
             closed = self._closed
