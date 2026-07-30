@@ -1671,11 +1671,26 @@ class SessionManager:
         return [session.summary().to_json() for session in sessions]
 
     def active_model_count(self, *, provider: str, model: str, match_provider: bool) -> int:
-        with self._lock:
-            sessions = list(self._sessions.values())
+        return len(
+            self.active_model_agent_ids(
+                provider=provider,
+                model=model,
+                match_provider=match_provider,
+            )
+        )
 
-        count = 0
-        for session in sessions:
+    def active_model_agent_ids(
+        self,
+        *,
+        provider: str,
+        model: str,
+        match_provider: bool,
+    ) -> set[str]:
+        with self._lock:
+            sessions = list(self._sessions.items())
+
+        agent_ids: set[str] = set()
+        for agent_id, session in sessions:
             session_status, session_model, session_provider = session.status_info()
             if session_status not in CONCURRENCY_COUNTED_STATUSES:
                 continue
@@ -1683,8 +1698,11 @@ class SessionManager:
                 continue
             if match_provider and session_provider != provider:
                 continue
-            count += 1
-        return count
+            agent_ids.add(agent_id)
+        return agent_ids
+
+    def agent_status_info(self, agent_id: str) -> tuple[str, str, str]:
+        return self._get(agent_id).status_info()
 
     def has(self, agent_id: str) -> bool:
         with self._lock:

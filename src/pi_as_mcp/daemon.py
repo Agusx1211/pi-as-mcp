@@ -19,7 +19,13 @@ from typing import Any
 from pi_as_mcp.config import AppConfig, ModelConcurrencyLimit, load_config
 from pi_as_mcp.pi_rpc import PiRpcError, PiRpcRunner, ToolMode, resolve_model
 from pi_as_mcp.paths import session_dir, socket_path
-from pi_as_mcp.sessions import SessionManager, validate_response_verbosity
+from pi_as_mcp.sessions import (
+    CONCURRENCY_COUNTED_STATUSES,
+    ReplyBehavior,
+    SessionManager,
+    SessionSnapshot,
+    validate_response_verbosity,
+)
 from pi_as_mcp.stats import StatsStore
 
 SO_PEERCRED = 17
@@ -79,6 +85,13 @@ class ParentIdentity:
     owner_pid: int | None
     label: str
     peer_pid: int | None = None
+
+
+@dataclass
+class _ReplyReservation:
+    provider: str
+    model: str
+    ref_count: int = 1
 
 
 def proc_cmdline(pid: int) -> str | None:
@@ -253,6 +266,10 @@ class DaemonState:
         # The reservation keeps the limit honest during that window, before the
         # session is registered with its manager and visible to active counts.
         self._pending_starts: dict[tuple[str, str], int] = {}
+        # Replies can turn idle sessions active without spawning a new agent.
+        # One ref-counted reservation per agent bridges prompt acknowledgement
+        # without double-counting concurrent replies to that same agent.
+        self._pending_replies: dict[tuple[str, str], _ReplyReservation] = {}
         self._stats = StatsStore()
         self._closed = False
         self._reaper = threading.Thread(target=self._reap_closed_parents, daemon=True)
@@ -333,6 +350,48 @@ class DaemonState:
             identity=identity,
         )
         return snapshot.to_json(verbosity="summary")
+
+    def reply(
+        self,
+        identity: ParentIdentity,
+        *,
+        agent_id: str,
+        prompt: str,
+        behavior: ReplyBehavior,
+    ) -> tuple[SessionSnapshot, dict[str, Any], ParentIdentity]:
+        # Find the agent and reserve its model slot as one atomic daemon action.
+        # The reservation also bridges a running turn that finishes while its
+        # follow-up prompt is waiting for Pi's acknowledgement.
+        with self._lock:
+            match = self.manager_identity_for_agent(agent_id)
+            manager, target_identity = match if match else (self.manager_for(identity), identity)
+            status, model, provider = manager.agent_status_info(agent_id)
+            reservation_key = (target_identity.scope_id, agent_id)
+            reservation = self._pending_replies.get(reservation_key)
+            if reservation is None:
+                if status not in CONCURRENCY_COUNTED_STATUSES:
+                    self._enforce_concurrency_limits_locked(
+                        load_config(),
+                        provider=provider,
+                        model=model,
+                    )
+                self._pending_replies[reservation_key] = _ReplyReservation(
+                    provider=provider,
+                    model=model,
+                )
+            else:
+                reservation.ref_count += 1
+
+        try:
+            snapshot, ack = manager.reply_with_details(
+                agent_id,
+                prompt=prompt,
+                behavior=behavior,
+            )
+        finally:
+            with self._lock:
+                self._release_reply_locked(reservation_key)
+        return snapshot, ack, target_identity
 
     def record_agent_snapshot(
         self,
@@ -440,15 +499,26 @@ class DaemonState:
             )
 
     def _active_model_count_locked(self, model_limit: ModelConcurrencyLimit) -> int:
-        active = sum(
-            manager.active_model_count(
-                provider=model_limit.provider,
-                model=model_limit.model,
-                match_provider=model_limit.match_provider,
+        active_agent_keys: set[tuple[str, str]] = set()
+        for scope_id, manager in self._managers.items():
+            active_agent_keys.update(
+                (scope_id, agent_id)
+                for agent_id in manager.active_model_agent_ids(
+                    provider=model_limit.provider,
+                    model=model_limit.model,
+                    match_provider=model_limit.match_provider,
+                )
             )
-            for manager in self._managers.values()
+        active_agent_keys.update(
+            reservation_key
+            for reservation_key, reservation in self._pending_replies.items()
+            if reservation.model == model_limit.model
+            and (
+                not model_limit.match_provider
+                or reservation.provider == model_limit.provider
+            )
         )
-        return active + self._pending_start_count_locked(model_limit)
+        return len(active_agent_keys) + self._pending_start_count_locked(model_limit)
 
     def _pending_start_count_locked(self, model_limit: ModelConcurrencyLimit) -> int:
         total = 0
@@ -471,6 +541,14 @@ class DaemonState:
             self._pending_starts[key] = remaining
         else:
             self._pending_starts.pop(key, None)
+
+    def _release_reply_locked(self, key: tuple[str, str]) -> None:
+        reservation = self._pending_replies.get(key)
+        if reservation is None:
+            return
+        reservation.ref_count -= 1
+        if reservation.ref_count <= 0:
+            self._pending_replies.pop(key, None)
 
     def _record_agent_snapshot(
         self,
@@ -659,10 +737,9 @@ class RequestHandler(socketserver.StreamRequestHandler):
 
         if command == "reply":
             agent_id = required_str(request, "agent_id")
-            match = STATE.manager_identity_for_agent(agent_id)
-            target_manager, target_identity = match if match else (manager_for_scope(), identity)
-            snapshot, ack = target_manager.reply_with_details(
-                agent_id,
+            snapshot, ack, target_identity = STATE.reply(
+                identity,
+                agent_id=agent_id,
                 prompt=required_str(request, "prompt"),
                 behavior=request.get("behavior", "auto"),
             )
