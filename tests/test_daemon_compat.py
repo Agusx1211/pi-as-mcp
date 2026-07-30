@@ -15,6 +15,7 @@ from pi_as_mcp.compat import (
 )
 from pi_as_mcp.daemon import RequestHandler
 from pi_as_mcp.daemon_client import DaemonClient, DaemonClientError
+from pi_as_mcp.pi_rpc import PiRpcError
 
 
 def encoded(response: dict[str, object]) -> list[bytes]:
@@ -48,6 +49,7 @@ def test_matching_daemon_is_probed_once_per_socket(monkeypatch) -> None:
 def test_matching_checked_envelope_dispatches_nested_request() -> None:
     class Handler:
         handle_request = RequestHandler.handle_request
+        _dispatch_request = RequestHandler._dispatch_request
 
         @staticmethod
         def peer_pid() -> int:
@@ -63,6 +65,58 @@ def test_matching_checked_envelope_dispatches_nested_request() -> None:
 
     assert "agents" in response
     assert "stats" in response
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"command": "delegate", "prompt": "must not run"},
+        {"command": "reply", "agent_id": "a1", "prompt": "must not run"},
+        {"command": "stop", "agent_id": "a1"},
+    ],
+)
+def test_raw_side_effecting_commands_never_dispatch(
+    payload: dict[str, object],
+) -> None:
+    handler = Mock()
+    handler._dispatch_request = Mock(
+        side_effect=AssertionError("raw operation was dispatched")
+    )
+
+    with pytest.raises(PiRpcError, match="compatibility envelope required"):
+        RequestHandler.handle_request(handler, payload)
+
+    handler._dispatch_request.assert_not_called()
+
+
+def test_matching_checked_operation_dispatches() -> None:
+    handler = Mock()
+    handler._dispatch_request.return_value = {"accepted": True}
+    nested = {"command": "delegate", "prompt": "checked"}
+
+    response = RequestHandler.handle_request(
+        handler,
+        {
+            "command": CHECKED_REQUEST_COMMAND,
+            **compatibility_identity(),
+            "request": nested,
+        },
+    )
+
+    assert response == {"accepted": True}
+    handler._dispatch_request.assert_called_once_with(nested)
+
+
+def test_raw_tui_summary_remains_available_for_legacy_drain(monkeypatch) -> None:
+    agents = [{"agent_id": "a1", "status": "running"}]
+    monkeypatch.setattr("pi_as_mcp.daemon.STATE.global_summary", lambda: agents)
+    monkeypatch.setattr("pi_as_mcp.daemon.STATE.stats_summary", lambda: {"agents": 1})
+    handler = Mock()
+
+    response = RequestHandler.handle_request(handler, {"command": "tui_summary"})
+
+    assert response == {"agents": agents, "stats": {"agents": 1}}
+    handler.peer_pid.assert_not_called()
 
 
 def test_mismatched_daemon_blocks_nested_request(monkeypatch) -> None:

@@ -203,7 +203,10 @@ deliberately want a separate daemon namespace.
 Clients verify the daemon protocol and installed code before sending an
 operation. This prevents a CLI or MCP server from silently using an older
 daemon started by another checkout. A mismatch leaves the existing daemon and
-its agents untouched and reports that no operation was executed.
+its agents untouched and reports that no operation was executed. The daemon
+also rejects commands from older clients that do not provide the checked
+request envelope; only its compatibility probe and passive drain summary remain
+available through the legacy wire format.
 
 After pulling changes or switching the installation that should own the shared
 daemon, refresh it from that checkout:

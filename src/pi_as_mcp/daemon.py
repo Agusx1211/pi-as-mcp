@@ -1004,8 +1004,23 @@ class RequestHandler(socketserver.StreamRequestHandler):
             nested_command = nested.get("command")
             if nested_command in {COMPAT_COMMAND, CHECKED_REQUEST_COMMAND}:
                 raise PiRpcError("nested compatibility commands are not allowed")
-            return self.handle_request(nested)
+            return self._dispatch_request(nested)
 
+        # refresh-daemon.sh must be able to drain both legacy daemons and this
+        # version before replacing either one. Keep exactly this passive summary
+        # available in the old raw protocol; every normal client command must use
+        # a compatibility-checked envelope.
+        if command == "tui_summary":
+            return {"agents": STATE.global_summary(), "stats": STATE.stats_summary()}
+        raise PiRpcError(
+            "client compatibility envelope required; no operation was executed. "
+            "Restart or update the pi-as-mcp client"
+        )
+
+    def _dispatch_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        command = request.get("command")
+        if not isinstance(command, str):
+            raise PiRpcError("request command must be a string")
         peer_pid = self.peer_pid()
         parent_hint = request.get("parent_hint")
         identity = parent_identity_from_peer(

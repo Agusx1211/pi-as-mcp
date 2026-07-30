@@ -90,7 +90,8 @@ PY
 # ---------------------------------------------------------------------------
 
 # Count agents currently running a turn. Connects directly to the socket so it
-# never auto-spawns a daemon. Prints "-1" when no daemon is reachable.
+# never auto-spawns a daemon. Prints "-1" when no daemon is reachable and
+# "-2" when a reachable daemon does not return a trustworthy drain snapshot.
 active_agent_count() {
     "$VENV_PY" - "$SOCKET" <<'PY'
 import json, socket, sys
@@ -107,14 +108,26 @@ try:
             if not chunk:
                 break
             buf += chunk
+except OSError:
+    print(-1)
+    raise SystemExit
+
+try:
     data = json.loads(buf.decode("utf-8"))
-    agents = data.get("agents") or []
+    if (
+        not isinstance(data, dict)
+        or data.get("daemon_error")
+        or not isinstance(data.get("agents"), list)
+        or not all(isinstance(agent, dict) for agent in data["agents"])
+    ):
+        raise ValueError("daemon returned no agent list")
+    agents = data["agents"]
     active = sum(
         1 for a in agents if str(a.get("status", "")).lower() in {"starting", "running"}
     )
     print(active)
-except (OSError, ValueError):
-    print(-1)
+except (TypeError, UnicodeDecodeError, ValueError):
+    print(-2)
 PY
 }
 
@@ -190,6 +203,15 @@ while true; do
     if [[ "$n" == "-1" ]]; then
         echo "    no reachable daemon — nothing to drain."
         break
+    fi
+    if [[ "$n" == "-2" ]]; then
+        if [[ "$FORCE" -eq 1 ]]; then
+            echo "    --force: daemon drain state could not be inspected; restarting anyway."
+            break
+        fi
+        echo "error: reachable daemon returned no trustworthy agent summary; aborting." >&2
+        echo "       re-run with --force only if interrupting live work is acceptable." >&2
+        exit 1
     fi
     if [[ "$n" -eq 0 ]]; then
         echo "    daemon is idle (0 active turns)."

@@ -242,6 +242,7 @@ def test_client_uses_shell_scope_unless_explicit_parent_id_is_set(
     monkeypatch,
 ) -> None:
     client = DaemonClient(default_scope_mode="cli-shell")
+    client._compatible_socket = (1, 1)
     sends: list[dict] = []
 
     def fake_send(payload, timeout):
@@ -249,16 +250,19 @@ def test_client_uses_shell_scope_unless_explicit_parent_id_is_set(
         return [b"{}"]
 
     monkeypatch.setattr(client, "_send", fake_send)
+    monkeypatch.setattr(client, "_socket_identity", lambda: (1, 1))
     monkeypatch.delenv("PI_AGENT_PARENT_ID", raising=False)
     client.request("summary")
 
     monkeypatch.setenv("PI_AGENT_PARENT_ID", "shared-build")
     client.request("summary")
 
-    assert sends[0]["parent_scope_mode"] == "cli-shell"
-    assert "parent_hint" not in sends[0]
-    assert sends[1]["parent_hint"] == "shared-build"
-    assert "parent_scope_mode" not in sends[1]
+    first_request = sends[0]["request"]
+    second_request = sends[1]["request"]
+    assert first_request["parent_scope_mode"] == "cli-shell"
+    assert "parent_hint" not in first_request
+    assert second_request["parent_hint"] == "shared-build"
+    assert "parent_scope_mode" not in second_request
 
 
 def test_client_does_not_resend_after_post_connect_failure(monkeypatch) -> None:
