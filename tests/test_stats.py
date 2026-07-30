@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from pi_as_mcp.stats import StatsStore
 
 
@@ -185,3 +187,44 @@ def test_stats_for_agents_returns_isolated_copies(tmp_path) -> None:
     fresh = store.stats_for_agents(["agent-1"])["agent-1"]
     assert fresh["status"] == "idle"
     assert len(fresh["scores"]) == 1
+
+
+def test_failed_append_does_not_corrupt_in_memory_aggregates(tmp_path, monkeypatch) -> None:
+    store = StatsStore(root=tmp_path)
+
+    def fail_append(*args, **kwargs) -> None:
+        raise OSError("stats directory is read-only")
+
+    monkeypatch.setattr(store, "_append_jsonl", fail_append)
+    with pytest.raises(OSError, match="read-only"):
+        store.record_agent_snapshot(
+            event_type="agent_started",
+            snapshot={"agent_id": "agent-1", "status": "running"},
+            requester={},
+        )
+
+    assert store.agent_stats("agent-1")["agent_id"] == "agent-1"
+    assert store.summary()["total_agents"] == 0
+
+
+def test_persistence_health_is_bounded_and_rate_limits_logs(tmp_path, caplog) -> None:
+    store = StatsStore(root=tmp_path)
+
+    with caplog.at_level("WARNING", logger="pi_as_mcp.stats"):
+        for _ in range(3):
+            store.note_persistence_failure("agent snapshot", OSError("disk full"))
+
+        first_health = store.telemetry_health()
+        assert first_health["failure_count"] == 3
+        assert first_health["warnings"][0]["count"] == 3
+        assert len(caplog.records) == 1
+
+        for index in range(10):
+            store.note_persistence_failure("transcript append", OSError(f"failure {index}"))
+
+    health = store.telemetry_health()
+    assert health["healthy"] is False
+    assert health["failure_count"] == 13
+    assert health["log_warnings_emitted"] == 5
+    assert len(health["warnings"]) == 5
+    assert len(caplog.records) == 5

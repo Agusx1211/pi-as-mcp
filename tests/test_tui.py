@@ -143,6 +143,16 @@ def test_stats_summary_label_formats_persisted_totals() -> None:
         == "agents 3  observed 2  unobserved 1  scores 4  avg score 7.25"
     )
     assert stats_summary_label({}) == "agents 0  observed 0  unobserved 0  scores 0"
+    assert stats_summary_label(
+        {
+            "total_agents": 3,
+            "observed_agents": 2,
+            "unobserved_agents": 1,
+            "scores": 4,
+            "average_score": 7.25,
+            "telemetry": {"healthy": False, "failure_count": 6},
+        }
+    ).endswith("telemetry errors 6")
 
 
 def test_tui_reconcile_selection_keeps_existing_agent() -> None:
