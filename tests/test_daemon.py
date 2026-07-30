@@ -141,6 +141,25 @@ def write_score_config(tmp_path: Path, *, enabled: bool) -> Path:
     return path
 
 
+def write_session_policy_config(
+    path: Path,
+    *,
+    persist_sessions: bool,
+    idle_eviction_seconds: float,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "persist_sessions": persist_sessions,
+                    "idle_eviction_seconds": idle_eviction_seconds,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def write_fake_pi(tmp_path: Path) -> Path:
     path = tmp_path / "fake-pi-daemon"
     path.write_text(
@@ -267,6 +286,139 @@ while True:
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def test_daemon_reloads_session_policy_for_existing_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_pi = write_replyable_fake_pi(tmp_path)
+    config = tmp_path / "config.json"
+    durable_sessions = tmp_path / "durable-sessions"
+    write_session_policy_config(
+        config,
+        persist_sessions=True,
+        idle_eviction_seconds=120,
+    )
+    monkeypatch.setenv("PI_AS_MCP_CONFIG", str(config))
+    monkeypatch.setenv("PI_AS_MCP_SESSION_DIR", str(durable_sessions))
+    monkeypatch.setenv("PI_AS_MCP_STATS_DIR", str(tmp_path / "stats"))
+
+    state = DaemonState()
+    identity = ParentIdentity(scope_id="live-config-scope", owner_pid=None, label="test")
+    try:
+        manager = state.manager_for(identity)
+        manager._runner.pi_bin = str(fake_pi)
+
+        persisted_start = state.start(
+            identity,
+            prompt="idle persisted",
+            cwd=str(tmp_path),
+            model="local/example-model",
+            provider=None,
+            tool_mode="none",
+            include_events=False,
+        )
+        persisted_id = str(persisted_start["agent_id"])
+        persisted_done, timed_out = manager.listen(
+            persisted_id,
+            after_turn_count=0,
+            timeout_seconds=5,
+        )
+        assert timed_out is False
+        assert persisted_done.status == "idle"
+        persisted = manager._get(persisted_id)
+        assert persisted.session_dir == durable_sessions
+        assert persisted.idle_eviction_seconds == 120
+
+        # Simulate an agent that already depends on its durable state, then
+        # disable both persistence and eviction in the same long-lived scope.
+        assert persisted._evict() is True
+        assert persisted._evicted is True
+        write_session_policy_config(
+            config,
+            persist_sessions=False,
+            idle_eviction_seconds=0,
+        )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if persisted.idle_eviction_seconds == 0:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("daemon did not apply the saved session policy")
+        resumed, _ack, _target = state.reply(
+            identity,
+            agent_id=persisted_id,
+            prompt="idle resumed",
+            behavior="auto",
+        )
+        assert resumed.status in {"starting", "running", "idle"}
+        resumed_done, resumed_timeout = manager.listen(
+            persisted_id,
+            after_turn_count=1,
+            timeout_seconds=5,
+        )
+        assert resumed_timeout is False
+        assert resumed_done.status == "idle"
+        # The original durable capability remains so the evicted agent was not
+        # stranded, but live policy prevents it from being evicted again.
+        assert persisted.session_dir == durable_sessions
+        assert persisted.idle_eviction_seconds == 0
+        assert persisted.process is not None
+        assert persisted.process.poll() is None
+
+        ephemeral_start = state.start(
+            identity,
+            prompt="idle ephemeral",
+            cwd=str(tmp_path),
+            model="local/example-model",
+            provider=None,
+            tool_mode="none",
+            include_events=False,
+        )
+        ephemeral_id = str(ephemeral_start["agent_id"])
+        ephemeral_done, ephemeral_timeout = manager.listen(
+            ephemeral_id,
+            after_turn_count=0,
+            timeout_seconds=5,
+        )
+        assert ephemeral_timeout is False
+        assert ephemeral_done.status == "idle"
+        ephemeral = manager._get(ephemeral_id)
+        assert ephemeral.session_dir is None
+        assert ephemeral.idle_eviction_seconds == 0
+
+        # Reverse both toggles. Existing persisted agents adopt the live
+        # threshold; existing ephemeral agents cannot safely be retrofitted and
+        # stay resident. A newly created agent gets full persistence.
+        write_session_policy_config(
+            config,
+            persist_sessions=True,
+            idle_eviction_seconds=120,
+        )
+        assert state.manager_for(identity) is manager
+        assert persisted.session_dir == durable_sessions
+        assert persisted.idle_eviction_seconds == 120
+        assert ephemeral.session_dir is None
+        assert ephemeral.idle_eviction_seconds == 0
+        assert ephemeral.process is not None
+        assert ephemeral.process.poll() is None
+
+        new_persisted_start = state.start(
+            identity,
+            prompt="idle new persisted",
+            cwd=str(tmp_path),
+            model="local/example-model",
+            provider=None,
+            tool_mode="none",
+            include_events=False,
+        )
+        new_persisted = manager._get(str(new_persisted_start["agent_id"]))
+        assert new_persisted.session_dir == durable_sessions
+        assert new_persisted.idle_eviction_seconds == 120
+    finally:
+        state.close()
 
 
 def write_slow_fake_pi(tmp_path: Path, *, delay: float) -> Path:
